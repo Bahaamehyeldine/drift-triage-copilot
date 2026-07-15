@@ -27,15 +27,15 @@ Example payload:
 The platform needs to tell the Agent when something worth investigating has happened, without flooding it with noise or losing alerts to transient failures. The brief requires this to be webhook-driven (or defensibly polled) and treats schema changes as breaking, so the contract needs to be explicit and versioned from day one.
 
 **Reasoning:**
-- *Bundled, not per-feature:* the brief refers to "the drift report" in the singular. Bundling every signal from one check cycle into a single event means the Agent always reasons over the full picture at once, and avoids a message-ordering/correlation problem that a per-feature design would create (e.g. two features crossing severity thresholds in the same cycle would otherwise arrive as two separate, hard-to-correlate calls).
-- *Fire only on increase, never on improvement:* an "improved" reading carries the same false-signal risk as the threshold-flapping problem below — one good reading doesn't prove the drift resolved. Investigations are closed by an explicit action (human, or a deliberate replay check), not by a transient "looks better now" event.
-- *"Notified" severity, tracked separately from "computed" severity:* if the webhook fails delivery after all retries and we still advanced our internal state to "current = high," a later check where severity doesn't change further would never re-fire — the alert would be silently lost forever. Keeping the two states separate means a failed delivery is retried for free on the next scheduled check, with no separate recovery mechanism needed.
-- *PSI / chi² p-value with fixed bands:* standard, well-documented thresholds rather than inventing our own; using the p-value (not the raw chi² statistic) keeps the severity rule comparable across categorical features with different numbers of categories (raw chi² statistics aren't comparable across differing degrees of freedom).
-- *Shared-secret header, not full request signing:* the call never leaves the docker-compose network in this project's scope, so a lightweight shared secret is proportionate. Added anyway (rather than skipped entirely) as cheap insurance against the network boundary changing later (e.g. a future cloud deployment).
+- *Bundled, not per-feature:* the brief refers to "the drift report" in the singular. Bundling every signal from one check cycle into a single event means the Agent always reasons over the full picture at once, and avoids a message-ordering/correlation problem that a per-feature design would create.
+- *Fire only on increase, never on improvement:* an "improved" reading carries the same false-signal risk as threshold flapping — one good reading doesn't prove the drift resolved. Investigations are closed by an explicit action, not by a transient "looks better now" event.
+- *"Notified" severity, tracked separately from "computed" severity:* if the webhook fails delivery after all retries and we still advanced our internal state to "current = high," a later check where severity doesn't change further would never re-fire — the alert would be silently lost forever. Keeping the two states separate means a failed delivery is retried for free on the next scheduled check.
+- *PSI / chi² p-value with fixed bands:* standard, well-documented thresholds; using the p-value (not the raw chi² statistic) keeps the severity rule comparable across categorical features with different numbers of categories.
+- *Shared-secret header, not full request signing:* the call never leaves the docker-compose network in this project's scope, so a lightweight shared secret is proportionate. Added anyway as cheap insurance against the network boundary changing later.
 
 **Known limitations (deferred):**
-- No debouncing/hysteresis around threshold boundaries — a metric oscillating right at a cutoff can still fire repeatedly. Accepted for v0.1; documented rather than solved.
-- No cap on how long the Model Service will silently keep retrying notification if the Agent is down for an extended period (many check cycles). Would need a dashboard-visible alert if this becomes a real problem.
+- No debouncing/hysteresis around threshold boundaries.
+- No cap on how long the Model Service will silently keep retrying notification if the Agent is down for an extended period.
 
 ---
 
@@ -48,12 +48,51 @@ After a human approves an action in the dashboard's HIL inbox, the Agent calls t
 This is the one HTTP call in the system that actually mutates Production. The brief explicitly flags the hard problem here: a human might approve a recommendation that's since gone stale because a newer drift event arrived while the approval was pending.
 
 **Reasoning:**
-- *HMAC over the body, not just a shared secret:* this call mutates production state, so it warrants a stronger guarantee than "the caller knows a password" — HMAC also proves the payload wasn't tampered with in transit, since any change to the signed content invalidates the signature.
+- *HMAC over the body, not just a shared secret:* this call mutates production state, so it warrants a stronger guarantee than "the caller knows a password" — HMAC also proves the payload wasn't tampered with in transit.
 - *`artifact_digest` alongside name/version:* protects against promoting the wrong bytes if a version label were ever reused or corrupted.
-- *Staleness via `based_on_report_id` + "latest known report" state:* this is an optimistic-concurrency check — the same pattern used when a shared document rejects a save based on stale content. Tracking "latest report" on *every* check (not just severity-increasing ones) matters: without it, a quiet *improvement* between recommendation and approval would go undetected, and a human could approve a promotion based on already-resolved bad news.
-- *On a 409, the Agent reuses the existing investigation* (attaches the newer report, re-runs the recommendation, requires fresh approval) rather than discarding it — this preserves the audit trail instead of losing prior context.
-- *Agent-only caller, no direct/"break-glass" path in v0.1:* allowing a second route to Production would reopen the exact registry/checkpoint desync problem the brief separately warns about (the Agent's investigation state would have no way of knowing a promotion happened outside its own flow). A proper emergency-override mechanism is a real feature with its own auth and audit needs — deliberately deferred rather than half-built. MLflow's own registry remains a true, if unsupported, escape hatch outside this system's guarantees.
+- *Staleness via `based_on_report_id` + "latest known report" state:* an optimistic-concurrency check. Tracking "latest report" on every check (not just severity-increasing ones) matters — without it, a quiet improvement between recommendation and approval would go undetected.
+- *On a 409, the Agent reuses the existing investigation* rather than discarding it — preserves the audit trail instead of losing prior context.
+- *Agent-only caller, no direct/"break-glass" path in v0.1:* allowing a second route to Production would reopen the exact registry/checkpoint desync problem addressed in Decision 5. A proper emergency-override mechanism is real scope, deliberately deferred rather than half-built.
 
 **Known limitations (deferred):**
 - No break-glass / manual override path if the Agent itself is down or broken.
-- Emergency intervention, if ever needed, currently means going around this system entirely via MLflow directly — acceptable for v0.1, revisit if this becomes a real operational gap.
+- Emergency intervention currently means going around this system entirely via MLflow directly.
+
+---
+
+## 3. Retrain Job — Idempotent Execution
+
+**Decision:**
+Every retrain job includes a unique `retrain_job_id`, reused across all retries. Before starting training, the worker atomically checks and claims this ID in Postgres.
+
+**Context:**
+Redis may redeliver a job after a network failure, worker restart, or timeout. Without a durable idempotency check, the same logical retrain job could start multiple expensive training runs.
+
+**Reasoning:**
+The key must be checked and claimed **atomically** before training begins, not merely included in the queue message. If the ID already exists as running or completed, the worker must not launch another run and should reuse the existing job state or result. A simple "check, then start" approach is not sufficient because two workers could check at nearly the same time, both see that the job has not started, and both begin training. Likewise, checking only Redis or checking after training has already started would still allow duplicate executions during retries or worker restarts.
+
+---
+
+## 4. Checkpoint Resume — Stale Model URI Handling
+
+**Decision:**
+When resuming from a checkpoint, the Agent must first ask the Model Service or registry whether `investigating_model_uri` still exists and remains in the expected stage.
+
+**Context:**
+A checkpoint contains frozen state that may be outdated if the model was deleted, replaced, promoted, archived, or rolled back while the Agent was paused.
+
+**Reasoning:**
+The Agent must not continue using stale checkpoint data. If the model is missing or its state has changed, the investigation is marked stale or invalidated, with the reason recorded and shown in the Dashboard rather than silently discarded.
+
+---
+
+## 5. Checkpoint Store vs. Model Registry — Source of Truth
+
+**Decision:**
+Do not attempt to keep the checkpoint store and model registry perfectly synchronized. The model registry is the source of truth, and its live state must be re-verified before every consequential action.
+
+**Context:**
+The checkpoint store preserves the Agent's progress and prior context, but registry state can change independently through promotion, rollback, deletion, or other operations.
+
+**Reasoning:**
+Trying to maintain strict synchronization would add complexity without eliminating stale-state risks. The safer pattern is to treat checkpointed registry information as a snapshot, defer to the live registry, and stop or invalidate the workflow when the two no longer match. This is the same principle applied concretely in Decision 2 (promotion staleness check) and Decision 4 (checkpoint resume check) — those are two specific instances of this general rule, not separate mechanisms.
