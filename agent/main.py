@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import uuid
 from typing import Any
 
 import sqlalchemy as sa
@@ -16,9 +17,17 @@ from pydantic import BaseModel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
 
 app = FastAPI(
     title="Triage Agent",
@@ -31,10 +40,102 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 
 # ---------------------------------------------------------------------------
-# Database
+# Database metadata
 # ---------------------------------------------------------------------------
 
 metadata = sa.MetaData()
+
+
+investigations = sa.Table(
+    "investigations",
+    metadata,
+    sa.Column(
+        "investigation_id",
+        sa.String(length=64),
+        primary_key=True,
+    ),
+    sa.Column(
+        "thread_id",
+        sa.String(length=64),
+        nullable=False,
+        unique=True,
+    ),
+    sa.Column(
+        "model_name",
+        sa.String(length=255),
+        nullable=False,
+    ),
+    sa.Column(
+        "model_version",
+        sa.String(length=128),
+        nullable=False,
+    ),
+    sa.Column(
+        "model_uri",
+        sa.String(length=1024),
+        nullable=False,
+    ),
+    sa.Column(
+        "triggering_report_id",
+        sa.String(length=128),
+        nullable=False,
+        unique=True,
+    ),
+    sa.Column(
+        "current_report_id",
+        sa.String(length=128),
+        nullable=False,
+    ),
+    sa.Column(
+        "status",
+        sa.String(length=32),
+        nullable=False,
+        server_default="open",
+    ),
+    sa.Column(
+        "current_severity",
+        sa.String(length=16),
+        nullable=False,
+    ),
+    sa.Column(
+        "recommended_action",
+        sa.String(length=64),
+        nullable=True,
+    ),
+    sa.Column(
+        "resolution",
+        sa.Text(),
+        nullable=True,
+    ),
+    sa.Column(
+        "stale_reason",
+        sa.Text(),
+        nullable=True,
+    ),
+    sa.Column(
+        "invalidation_reason",
+        sa.Text(),
+        nullable=True,
+    ),
+    sa.Column(
+        "created_at",
+        sa.DateTime(timezone=True),
+        nullable=False,
+        server_default=sa.func.now(),
+    ),
+    sa.Column(
+        "updated_at",
+        sa.DateTime(timezone=True),
+        nullable=False,
+        server_default=sa.func.now(),
+    ),
+    sa.Column(
+        "resolved_at",
+        sa.DateTime(timezone=True),
+        nullable=True,
+    ),
+)
+
 
 webhook_receipts = sa.Table(
     "webhook_receipts",
@@ -59,6 +160,10 @@ webhook_receipts = sa.Table(
     sa.Column(
         "investigation_id",
         sa.String(length=64),
+        sa.ForeignKey(
+            "investigations.investigation_id",
+            ondelete="SET NULL",
+        ),
         nullable=True,
     ),
     sa.Column(
@@ -85,17 +190,35 @@ engine = (
 
 
 # ---------------------------------------------------------------------------
-# Response models
+# API response models
 # ---------------------------------------------------------------------------
 
 class WebhookResponse(BaseModel):
     status: str
     report_id: str
+    investigation_id: str | None = None
 
 
 class ErrorResponse(BaseModel):
     status: str
     error: str
+
+
+# ---------------------------------------------------------------------------
+# Internal data
+# ---------------------------------------------------------------------------
+
+class InvestigationInput(BaseModel):
+    report_id: str
+    model_name: str
+    model_version: str
+    current_severity: str
+
+
+class InvestigationCreationResult(BaseModel):
+    created: bool
+    report_id: str
+    investigation_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +230,8 @@ def create_signature(
     secret: str,
 ) -> str:
     """
-    Recompute the HMAC-SHA256 signature over the exact raw request bytes.
+    Recompute the HMAC-SHA256 signature over the exact bytes received
+    from the Model Service.
     """
     digest = hmac.new(
         secret.encode("utf-8"),
@@ -119,7 +243,7 @@ def create_signature(
 
 
 # ---------------------------------------------------------------------------
-# Responses
+# Response helpers
 # ---------------------------------------------------------------------------
 
 def error_response(
@@ -129,8 +253,7 @@ def error_response(
     error: str,
 ) -> JSONResponse:
     """
-    Return a structured error response without FastAPI's default
-    top-level "detail" wrapper.
+    Return the structured error shape documented by this API.
     """
     body = ErrorResponse(
         status=status,
@@ -144,28 +267,126 @@ def error_response(
 
 
 # ---------------------------------------------------------------------------
+# Webhook payload validation
+# ---------------------------------------------------------------------------
+
+def extract_investigation_input(
+    payload: dict[str, Any],
+) -> InvestigationInput:
+    """
+    Extract and validate the fields required to create an investigation.
+
+    Full webhook schema validation can be formalized later. Pass 3 validates
+    the contract fields that are required for persistence.
+    """
+
+    report_id = payload.get("report_id")
+    model = payload.get("model")
+    overall_severity = payload.get("overall_severity")
+
+    if not isinstance(report_id, str) or not report_id.strip():
+        raise ValueError("Missing or invalid report_id")
+
+    if not isinstance(model, dict):
+        raise ValueError("Missing or invalid model")
+
+    model_name = model.get("name")
+    model_version = model.get("version")
+
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise ValueError("Missing or invalid model.name")
+
+    if not isinstance(model_version, str) or not model_version.strip():
+        raise ValueError("Missing or invalid model.version")
+
+    if not isinstance(overall_severity, dict):
+        raise ValueError("Missing or invalid overall_severity")
+
+    current_severity = overall_severity.get("current")
+
+    if (
+        not isinstance(current_severity, str)
+        or not current_severity.strip()
+    ):
+        raise ValueError(
+            "Missing or invalid overall_severity.current"
+        )
+
+    return InvestigationInput(
+        report_id=report_id,
+        model_name=model_name,
+        model_version=model_version,
+        current_severity=current_severity,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Model identity
+# ---------------------------------------------------------------------------
+
+def build_model_uri(
+    model_name: str,
+    model_version: str,
+) -> str:
+    """
+    Construct the canonical MLflow model URI from the model identity
+    already present in the webhook contract.
+
+    This keeps URI construction in one place and avoids adding redundant
+    model_uri data to the webhook payload.
+    """
+    return f"models:/{model_name}/{model_version}"
+
+
+# ---------------------------------------------------------------------------
+# IDs
+# ---------------------------------------------------------------------------
+
+def generate_investigation_id() -> str:
+    return f"inv_{uuid.uuid4().hex}"
+
+
+def generate_thread_id() -> str:
+    return f"thread_{uuid.uuid4().hex}"
+
+
+# ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
 
-def persist_webhook_receipt(report_id: str) -> bool:
+def create_investigation_for_webhook(
+    investigation_input: InvestigationInput,
+) -> InvestigationCreationResult:
     """
-    Atomically insert a webhook receipt.
+    Atomically:
 
-    Returns:
-        True:
-            The receipt was inserted and this is the first delivery.
+    1. Claim the report_id by inserting webhook_receipts.
+    2. Detect duplicate deliveries through the report_id primary key.
+    3. Create the investigation.
+    4. Link the receipt to the investigation.
+    5. Mark the receipt as processed.
 
-        False:
-            The report_id already existed and this is a duplicate delivery.
+    The entire operation runs in one transaction.
 
-    PostgreSQL performs the uniqueness check and insert atomically, avoiding
-    the race condition that would exist with a separate SELECT followed by
-    INSERT.
+    If investigation creation or receipt linking fails, the initial receipt
+    insert is rolled back as well. A later webhook retry can therefore safely
+    attempt the operation again.
     """
+
     if engine is None:
         raise RuntimeError("DATABASE_URL is not configured")
 
-    statement = (
+    report_id = investigation_input.report_id
+
+    investigation_id = generate_investigation_id()
+    thread_id = generate_thread_id()
+
+    model_uri = build_model_uri(
+        investigation_input.model_name,
+        investigation_input.model_version,
+    )
+
+    receipt_insert = (
         pg_insert(webhook_receipts)
         .values(
             report_id=report_id,
@@ -176,12 +397,69 @@ def persist_webhook_receipt(report_id: str) -> bool:
         .returning(webhook_receipts.c.report_id)
     )
 
+    investigation_insert = sa.insert(
+        investigations
+    ).values(
+        investigation_id=investigation_id,
+        thread_id=thread_id,
+        model_name=investigation_input.model_name,
+        model_version=investigation_input.model_version,
+        model_uri=model_uri,
+        triggering_report_id=report_id,
+        current_report_id=report_id,
+        status="open",
+        current_severity=investigation_input.current_severity,
+    )
+
+    receipt_update = (
+        sa.update(webhook_receipts)
+        .where(
+            webhook_receipts.c.report_id == report_id
+        )
+        .values(
+            investigation_id=investigation_id,
+            processing_status="processed",
+            processed_timestamp=sa.func.now(),
+        )
+    )
+
     with engine.begin() as connection:
         inserted_report_id = connection.execute(
-            statement
+            receipt_insert
         ).scalar_one_or_none()
 
-    return inserted_report_id is not None
+        # ---------------------------------------------------------------
+        # Duplicate delivery
+        # ---------------------------------------------------------------
+
+        if inserted_report_id is None:
+            logger.info(
+                "Duplicate drift webhook detected: report_id=%s",
+                report_id,
+            )
+
+            return InvestigationCreationResult(
+                created=False,
+                report_id=report_id,
+            )
+
+        # ---------------------------------------------------------------
+        # New delivery
+        # ---------------------------------------------------------------
+
+        connection.execute(
+            investigation_insert
+        )
+
+        connection.execute(
+            receipt_update
+        )
+
+    return InvestigationCreationResult(
+        created=True,
+        report_id=report_id,
+        investigation_id=investigation_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +480,9 @@ def persist_webhook_receipt(report_id: str) -> bool:
         },
         500: {
             "model": ErrorResponse,
-            "description": "Agent configuration or persistence error",
+            "description": (
+                "Agent configuration or persistence error"
+            ),
         },
     },
 )
@@ -210,17 +490,42 @@ async def receive_drift_webhook(
     request: Request,
 ) -> WebhookResponse | JSONResponse:
     """
-    Pass 2:
+    Pass 3 workflow:
 
-    1. Read the raw request bytes.
-    2. Verify the HMAC signature.
-    3. Parse JSON only after authenticity has been verified.
-    4. Extract report_id.
-    5. Atomically deduplicate through webhook_receipts.
-    6. Return 200 for both new and duplicate deliveries.
+        Model Service
+             |
+             v
+        raw webhook
+             |
+             v
+        verify HMAC
+             |
+             v
+        parse trusted JSON
+             |
+             v
+        validate investigation fields
+             |
+             v
+        atomic database transaction
+             |
+             +--> insert webhook_receipt
+             |
+             +--> duplicate?
+             |       |
+             |       +--> yes -> return 200 duplicate
+             |
+             +--> create investigation
+             |
+             +--> link receipt
+             |
+             +--> mark receipt processed
+             |
+             v
+        return 200 accepted
 
-    Investigation creation, LangGraph checkpointing, and Redis dispatch
-    intentionally remain outside this pass.
+    LangGraph checkpoint creation and Redis dispatch remain intentionally
+    outside Pass 3.
     """
 
     # ------------------------------------------------------------------
@@ -228,7 +533,9 @@ async def receive_drift_webhook(
     # ------------------------------------------------------------------
 
     if not DRIFT_WEBHOOK_SECRET:
-        logger.error("DRIFT_WEBHOOK_SECRET is not configured")
+        logger.error(
+            "DRIFT_WEBHOOK_SECRET is not configured"
+        )
 
         return error_response(
             status_code=500,
@@ -237,7 +544,9 @@ async def receive_drift_webhook(
         )
 
     if engine is None:
-        logger.error("DATABASE_URL is not configured")
+        logger.error(
+            "DATABASE_URL is not configured"
+        )
 
         return error_response(
             status_code=500,
@@ -246,7 +555,7 @@ async def receive_drift_webhook(
         )
 
     # ------------------------------------------------------------------
-    # Read the exact bytes signed by Model Service
+    # Read exact signed bytes
     # ------------------------------------------------------------------
 
     payload_bytes = await request.body()
@@ -265,6 +574,10 @@ async def receive_drift_webhook(
             status="unauthorized",
             error="Missing webhook signature",
         )
+
+    # ------------------------------------------------------------------
+    # Authenticate before processing content
+    # ------------------------------------------------------------------
 
     expected_signature = create_signature(
         payload_bytes,
@@ -286,15 +599,16 @@ async def receive_drift_webhook(
         )
 
     # ------------------------------------------------------------------
-    # Only parse JSON after authenticity has been verified
+    # Parse only after authentication
     # ------------------------------------------------------------------
 
     try:
-        payload: dict[str, Any] = json.loads(payload_bytes)
+        payload = json.loads(payload_bytes)
 
     except (json.JSONDecodeError, UnicodeDecodeError):
         logger.warning(
-            "Rejected authenticated webhook because body was invalid JSON"
+            "Rejected authenticated webhook because body "
+            "was invalid JSON"
         )
 
         return error_response(
@@ -303,59 +617,89 @@ async def receive_drift_webhook(
             error="Webhook body is not valid JSON",
         )
 
-    report_id = payload.get("report_id")
-
-    if not isinstance(report_id, str) or not report_id.strip():
+    if not isinstance(payload, dict):
         logger.warning(
-            "Rejected authenticated webhook with missing or invalid report_id"
+            "Rejected authenticated webhook because JSON "
+            "body was not an object"
         )
 
         return error_response(
             status_code=400,
             status="invalid_payload",
-            error="Webhook payload is missing a valid report_id",
+            error="Webhook body must be a JSON object",
         )
 
     # ------------------------------------------------------------------
-    # Deduplication
+    # Extract fields needed for investigation creation
     # ------------------------------------------------------------------
 
     try:
-        inserted = await run_in_threadpool(
-            persist_webhook_receipt,
-            report_id,
+        investigation_input = extract_investigation_input(
+            payload
+        )
+
+    except ValueError as exc:
+        logger.warning(
+            "Rejected authenticated webhook with invalid payload: %s",
+            exc,
+        )
+
+        return error_response(
+            status_code=400,
+            status="invalid_payload",
+            error=str(exc),
+        )
+
+    # ------------------------------------------------------------------
+    # Dedup + investigation creation
+    #
+    # Synchronous SQLAlchemy Core is intentionally executed in FastAPI's
+    # thread pool so the async event loop is not blocked by database I/O.
+    # ------------------------------------------------------------------
+
+    try:
+        result = await run_in_threadpool(
+            create_investigation_for_webhook,
+            investigation_input,
         )
 
     except Exception:
         logger.exception(
-            "Could not persist webhook receipt: report_id=%s",
-            report_id,
+            "Failed to process drift webhook: report_id=%s",
+            investigation_input.report_id,
         )
 
         return error_response(
             status_code=500,
             status="persistence_error",
-            error="Could not persist webhook receipt",
+            error="Could not create investigation",
         )
 
-    if not inserted:
-        logger.info(
-            "Duplicate drift webhook received: report_id=%s",
-            report_id,
-        )
+    # ------------------------------------------------------------------
+    # Duplicate delivery
+    # ------------------------------------------------------------------
 
+    if not result.created:
         return WebhookResponse(
             status="duplicate",
-            report_id=report_id,
+            report_id=result.report_id,
         )
 
+    # ------------------------------------------------------------------
+    # Successfully created investigation
+    # ------------------------------------------------------------------
+
     logger.info(
-        "Accepted new drift webhook: report_id=%s",
-        report_id,
+        "Created investigation: "
+        "investigation_id=%s report_id=%s model=%s version=%s",
+        result.investigation_id,
+        result.report_id,
+        investigation_input.model_name,
+        investigation_input.model_version,
     )
 
     return WebhookResponse(
         status="accepted",
-        report_id=report_id,
+        report_id=result.report_id,
+        investigation_id=result.investigation_id,
     )
-
