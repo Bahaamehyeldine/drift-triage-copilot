@@ -106,6 +106,35 @@ services:
 
     restart: unless-stopped
 
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+
+    environment:
+      DATABASE_URL: >-
+        postgresql+psycopg://postgres:postgres@postgres:5432/drift_triage
+
+      REDIS_URL: redis://redis:6379/0
+
+      RETRAIN_JOB_STREAM: async-tools:retrain
+      RETRAIN_CONSUMER_GROUP: retrain-workers
+      RETRAIN_CONSUMER_NAME: worker-1
+      REDIS_BLOCK_MS: "5000"
+      STUB_EXECUTION_SECONDS: "1"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+      redis:
+        condition: service_healthy
+
+      migrate:
+        condition: service_completed_successfully
+
+    restart: unless-stopped
+
   model_service:
     build:
       context: .
