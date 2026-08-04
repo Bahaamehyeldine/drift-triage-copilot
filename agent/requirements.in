@@ -1,0 +1,7 @@
+fastapi
+langgraph
+langgraph-checkpoint-postgres
+psycopg[binary,pool]
+redis
+sqlalchemy
+uvicorn[standard]
