@@ -9,6 +9,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, TypedDict
 
+import redis
 import sqlalchemy as sa
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
@@ -16,6 +17,7 @@ from fastapi.responses import JSONResponse
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
+from redis import Redis
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 
@@ -33,12 +35,16 @@ logger = logging.getLogger(__name__)
 
 DRIFT_WEBHOOK_SECRET = os.getenv("DRIFT_WEBHOOK_SECRET")
 DATABASE_URL = os.getenv("DATABASE_URL")
+REDIS_URL = os.getenv("REDIS_URL")
 
-# Allows a separate connection string later if checkpoint persistence is
-# moved to a dedicated database. For the MVP, it defaults to Postgres.
 LANGGRAPH_DATABASE_URL = os.getenv(
     "LANGGRAPH_DATABASE_URL",
     DATABASE_URL,
+)
+
+RETRAIN_JOB_STREAM = os.getenv(
+    "RETRAIN_JOB_STREAM",
+    "async-tools:retrain",
 )
 
 
@@ -48,11 +54,11 @@ LANGGRAPH_DATABASE_URL = os.getenv(
 
 class InvestigationGraphState(TypedDict):
     """
-    Minimal workflow state persisted for an investigation.
+    Minimal workflow state persisted for one investigation.
 
-    The investigations table remains authoritative for human-facing
-    lifecycle status. This state contains only the context required to
-    resume LangGraph execution.
+    Postgres investigation records remain authoritative for business-facing
+    lifecycle state. The checkpoint stores only workflow context required
+    to resume LangGraph execution.
     """
 
     investigation_id: str
@@ -66,11 +72,10 @@ def initialize_investigation(
     state: InvestigationGraphState,
 ) -> dict[str, str]:
     """
-    Minimal Pass 4 graph node.
+    Minimal deterministic graph node for the walking skeleton.
 
-    This node performs no triage or agent reasoning. It proves that the
-    investigation can enter a LangGraph workflow and persist its state
-    under the investigation's existing thread_id.
+    This proves that an investigation can enter a persisted LangGraph
+    workflow. Real triage, action, and communication logic is deferred.
     """
     logger.info(
         "Initializing investigation workflow: "
@@ -86,11 +91,9 @@ def initialize_investigation(
 
 def build_investigation_graph(
     checkpointer: PostgresSaver,
-):
+) -> Any:
     """
     Build the minimal persisted investigation graph.
-
-    The full triage/action/comms supervisor is intentionally deferred.
     """
     builder = StateGraph(InvestigationGraphState)
 
@@ -112,59 +115,6 @@ def build_investigation_graph(
     return builder.compile(
         checkpointer=checkpointer,
     )
-
-
-# ---------------------------------------------------------------------------
-# Application lifecycle
-# ---------------------------------------------------------------------------
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Initialize the LangGraph Postgres checkpointer once for the service
-    lifecycle rather than recreating it for every webhook request.
-    """
-    app.state.investigation_graph = None
-
-    if not LANGGRAPH_DATABASE_URL:
-        logger.error(
-            "LANGGRAPH_DATABASE_URL and DATABASE_URL are not configured; "
-            "checkpoint persistence is unavailable"
-        )
-        yield
-        return
-
-    try:
-        # PostgresSaver manages its own Postgres connection lifecycle.
-        with PostgresSaver.from_conn_string(
-            LANGGRAPH_DATABASE_URL
-        ) as checkpointer:
-            # Creates or upgrades LangGraph's checkpoint tables.
-            # For the MVP this is performed at startup.
-            checkpointer.setup()
-
-            app.state.investigation_graph = (
-                build_investigation_graph(checkpointer)
-            )
-
-            logger.info(
-                "LangGraph Postgres checkpointer initialized"
-            )
-
-            yield
-
-    except Exception:
-        logger.exception(
-            "Failed to initialize LangGraph checkpoint persistence"
-        )
-        raise
-
-
-app = FastAPI(
-    title="Triage Agent",
-    version="0.1.0",
-    lifespan=lifespan,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +257,9 @@ webhook_receipts = sa.Table(
 )
 
 
+# The configuration is validated during application startup. Keeping engine
+# construction here allows the persistence functions to remain small and
+# independent from FastAPI's Request object.
 engine = (
     sa.create_engine(
         DATABASE_URL,
@@ -318,6 +271,142 @@ engine = (
 
 
 # ---------------------------------------------------------------------------
+# Application lifecycle
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Fail fast when required configuration is missing, then initialize
+    long-lived infrastructure clients once per application process.
+    """
+    app.state.investigation_graph = None
+    app.state.redis_client = None
+
+    required_config = {
+        "DRIFT_WEBHOOK_SECRET": DRIFT_WEBHOOK_SECRET,
+        "DATABASE_URL": DATABASE_URL,
+        "LANGGRAPH_DATABASE_URL": LANGGRAPH_DATABASE_URL,
+        "REDIS_URL": REDIS_URL,
+    }
+
+    missing_config = [
+        name
+        for name, value in required_config.items()
+        if not value
+    ]
+
+    if missing_config:
+        raise RuntimeError(
+            "Missing required Agent configuration: "
+            + ", ".join(missing_config)
+        )
+
+    if engine is None:
+        raise RuntimeError(
+            "SQLAlchemy engine was not initialized"
+        )
+
+    redis_client: Redis | None = None
+
+    try:
+        # Confirm the application database is reachable before accepting
+        # webhook traffic.
+        def check_database_connection() -> None:
+            with engine.connect() as connection:
+                connection.execute(sa.text("SELECT 1"))
+
+        await run_in_threadpool(
+            check_database_connection,
+        )
+
+        logger.info(
+            "Application database connection initialized"
+        )
+
+        # Create one Redis client for the application process.
+        redis_client = redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+        )
+
+        await run_in_threadpool(
+            redis_client.ping,
+        )
+
+        app.state.redis_client = redis_client
+
+        logger.info(
+            "Redis connection initialized: stream=%s",
+            RETRAIN_JOB_STREAM,
+        )
+
+        # PostgresSaver manages the checkpoint connection lifecycle inside
+        # this context manager.
+        with PostgresSaver.from_conn_string(
+            LANGGRAPH_DATABASE_URL
+        ) as checkpointer:
+            checkpointer.setup()
+
+            app.state.investigation_graph = (
+                build_investigation_graph(checkpointer)
+            )
+
+            logger.info(
+                "LangGraph Postgres checkpointer initialized"
+            )
+
+            yield
+
+    except Exception:
+        logger.exception(
+            "Failed to initialize Agent infrastructure"
+        )
+        raise
+
+    finally:
+        app.state.investigation_graph = None
+        app.state.redis_client = None
+
+        if redis_client is not None:
+            try:
+                await run_in_threadpool(
+                    redis_client.close,
+                )
+
+                logger.info(
+                    "Redis connection closed"
+                )
+
+            except Exception:
+                logger.exception(
+                    "Failed to close Redis client cleanly"
+                )
+
+        if engine is not None:
+            try:
+                await run_in_threadpool(
+                    engine.dispose,
+                )
+
+                logger.info(
+                    "Application database engine disposed"
+                )
+
+            except Exception:
+                logger.exception(
+                    "Failed to dispose database engine cleanly"
+                )
+
+
+app = FastAPI(
+    title="Triage Agent",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+
+# ---------------------------------------------------------------------------
 # API models
 # ---------------------------------------------------------------------------
 
@@ -325,6 +414,7 @@ class WebhookResponse(BaseModel):
     status: str
     report_id: str
     investigation_id: str | None = None
+    retrain_job_id: str | None = None
 
 
 class ErrorResponse(BaseModel):
@@ -355,7 +445,7 @@ def create_signature(
     secret: str,
 ) -> str:
     """
-    Recompute the HMAC-SHA256 signature over the exact request bytes.
+    Recompute the HMAC-SHA256 signature over the exact request body.
     """
     digest = hmac.new(
         secret.encode("utf-8"),
@@ -377,7 +467,10 @@ def error_response(
     error: str,
 ) -> JSONResponse:
     """
-    Return a structured top-level error response.
+    Return a structured top-level error body.
+
+    JSONResponse avoids FastAPI's default HTTPException "detail" wrapper,
+    keeping runtime responses aligned with the documented response model.
     """
     body = ErrorResponse(
         status=status,
@@ -398,29 +491,37 @@ def extract_investigation_input(
     payload: dict[str, Any],
 ) -> InvestigationInput:
     """
-    Validate the webhook fields required by Pass 4.
+    Validate only the webhook fields required by the walking skeleton.
     """
     report_id = payload.get("report_id")
     model = payload.get("model")
     overall_severity = payload.get("overall_severity")
 
     if not isinstance(report_id, str) or not report_id.strip():
-        raise ValueError("Missing or invalid report_id")
+        raise ValueError(
+            "Missing or invalid report_id"
+        )
 
     if not isinstance(model, dict):
-        raise ValueError("Missing or invalid model")
+        raise ValueError(
+            "Missing or invalid model"
+        )
 
     model_name = model.get("name")
     model_version = model.get("version")
 
     if not isinstance(model_name, str) or not model_name.strip():
-        raise ValueError("Missing or invalid model.name")
+        raise ValueError(
+            "Missing or invalid model.name"
+        )
 
     if (
         not isinstance(model_version, str)
         or not model_version.strip()
     ):
-        raise ValueError("Missing or invalid model.version")
+        raise ValueError(
+            "Missing or invalid model.version"
+        )
 
     if not isinstance(overall_severity, dict):
         raise ValueError(
@@ -460,7 +561,7 @@ def build_model_uri(
 
 
 # ---------------------------------------------------------------------------
-# IDs
+# ID generation
 # ---------------------------------------------------------------------------
 
 def generate_investigation_id() -> str:
@@ -469,6 +570,10 @@ def generate_investigation_id() -> str:
 
 def generate_thread_id() -> str:
     return f"thread_{uuid.uuid4().hex}"
+
+
+def generate_retrain_job_id() -> str:
+    return f"retrain_{uuid.uuid4().hex}"
 
 
 # ---------------------------------------------------------------------------
@@ -480,13 +585,15 @@ def create_investigation_for_webhook(
 ) -> InvestigationCreationResult:
     """
     Atomically claim the webhook, create its investigation, and link the
-    receipt to the new investigation.
+    webhook receipt to the investigation.
 
-    LangGraph checkpoint persistence intentionally happens afterward,
-    outside this transaction.
+    Checkpoint persistence and Redis dispatch happen afterward because
+    they belong to separate transactional systems.
     """
     if engine is None:
-        raise RuntimeError("DATABASE_URL is not configured")
+        raise RuntimeError(
+            "Database engine is unavailable"
+        )
 
     report_id = investigation_input.report_id
     investigation_id = generate_investigation_id()
@@ -503,9 +610,13 @@ def create_investigation_for_webhook(
             report_id=report_id,
         )
         .on_conflict_do_nothing(
-            index_elements=[webhook_receipts.c.report_id],
+            index_elements=[
+                webhook_receipts.c.report_id,
+            ],
         )
-        .returning(webhook_receipts.c.report_id)
+        .returning(
+            webhook_receipts.c.report_id,
+        )
     )
 
     investigation_insert = (
@@ -557,9 +668,16 @@ def create_investigation_for_webhook(
             investigation_insert
         )
 
-        connection.execute(
+        receipt_update_result = connection.execute(
             receipt_update
         )
+
+        if receipt_update_result.rowcount != 1:
+            raise RuntimeError(
+                "Webhook receipt linking affected "
+                f"{receipt_update_result.rowcount} rows for "
+                f"report_id={report_id}"
+            )
 
     return InvestigationCreationResult(
         created=True,
@@ -576,11 +694,13 @@ def update_investigation_status(
     """
     Update the Dashboard-facing investigation status.
 
-    updated_at is explicitly refreshed because its database default only
-    runs during INSERT, not on subsequent UPDATE operations.
+    updated_at is explicitly refreshed because its server default applies
+    only during INSERT.
     """
     if engine is None:
-        raise RuntimeError("DATABASE_URL is not configured")
+        raise RuntimeError(
+            "Database engine is unavailable"
+        )
 
     statement = (
         sa.update(investigations)
@@ -595,7 +715,9 @@ def update_investigation_status(
     )
 
     with engine.begin() as connection:
-        result = connection.execute(statement)
+        result = connection.execute(
+            statement
+        )
 
         if result.rowcount != 1:
             raise RuntimeError(
@@ -617,10 +739,8 @@ def persist_initial_checkpoint(
     investigation_input: InvestigationInput,
 ) -> None:
     """
-    Invoke the minimal graph using the investigation's persisted thread_id.
-
-    LangGraph stores the resulting graph state as a checkpoint associated
-    with this thread.
+    Invoke the minimal graph under the investigation's persisted
+    LangGraph thread ID.
     """
     initial_state: InvestigationGraphState = {
         "investigation_id": investigation_id,
@@ -633,7 +753,7 @@ def persist_initial_checkpoint(
     config = {
         "configurable": {
             "thread_id": thread_id,
-        }
+        },
     }
 
     graph.invoke(
@@ -643,7 +763,77 @@ def persist_initial_checkpoint(
 
 
 # ---------------------------------------------------------------------------
-# Endpoint
+# Redis dispatch
+# ---------------------------------------------------------------------------
+
+def dispatch_retrain_job(
+    *,
+    redis_client: Redis,
+    retrain_job_id: str,
+    investigation_id: str,
+    report_id: str,
+    model_name: str,
+    source_model_version: str,
+) -> str:
+    """
+    Dispatch one retrain job to the configured Redis Stream.
+
+    Redis assigns the stream-entry ID. retrain_job_id is the durable
+    application-level idempotency key that the Worker will claim in
+    Postgres before performing expensive work.
+    """
+    job_payload = {
+        "job_type": "retrain",
+        "retrain_job_id": retrain_job_id,
+        "investigation_id": investigation_id,
+        "report_id": report_id,
+        "model_name": model_name,
+        "source_model_version": source_model_version,
+    }
+
+    stream_entry_id = redis_client.xadd(
+        RETRAIN_JOB_STREAM,
+        job_payload,
+    )
+
+    if not stream_entry_id:
+        raise RuntimeError(
+            "Redis XADD did not return a stream entry ID"
+        )
+
+    return str(stream_entry_id)
+
+
+# ---------------------------------------------------------------------------
+# Health endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/health")
+async def health(request: Request) -> dict[str, str]:
+    graph = getattr(
+        request.app.state,
+        "investigation_graph",
+        None,
+    )
+
+    redis_client = getattr(
+        request.app.state,
+        "redis_client",
+        None,
+    )
+
+    if graph is None or redis_client is None:
+        return {
+            "status": "not_ready",
+        }
+
+    return {
+        "status": "ok",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Drift webhook endpoint
 # ---------------------------------------------------------------------------
 
 @app.post(
@@ -661,8 +851,7 @@ def persist_initial_checkpoint(
         500: {
             "model": ErrorResponse,
             "description": (
-                "Agent configuration, persistence, or "
-                "checkpoint error"
+                "Persistence, checkpoint, or queue dispatch failure"
             ),
         },
     },
@@ -671,45 +860,17 @@ async def receive_drift_webhook(
     request: Request,
 ) -> WebhookResponse | JSONResponse:
     """
-    Pass 4 request flow:
+    Pass 5 request flow:
 
-    1. Authenticate the raw webhook body.
-    2. Parse and validate the trusted JSON payload.
-    3. Atomically create the receipt and investigation.
-    4. Return immediately for duplicate deliveries.
-    5. Invoke the minimal LangGraph using the stored thread_id.
-    6. Persist the resulting checkpoint in Postgres.
-    7. Keep the investigation status as "open" on success.
-    8. Mark it "checkpoint_failed" if graph persistence fails.
-
-    Redis dispatch remains outside this pass.
+    1. Read and authenticate the exact raw webhook bytes.
+    2. Parse and validate the authenticated JSON payload.
+    3. Atomically create the webhook receipt and investigation.
+    4. Return 200 for duplicate webhook deliveries.
+    5. Persist the initial LangGraph checkpoint.
+    6. Generate and dispatch a retrain job to Redis Streams.
+    7. Keep the investigation open on complete success.
+    8. Mark checkpoint_failed or dispatch_failed on partial failure.
     """
-
-    # ------------------------------------------------------------------
-    # Configuration
-    # ------------------------------------------------------------------
-
-    if not DRIFT_WEBHOOK_SECRET:
-        logger.error(
-            "DRIFT_WEBHOOK_SECRET is not configured"
-        )
-
-        return error_response(
-            status_code=500,
-            status="configuration_error",
-            error="DRIFT_WEBHOOK_SECRET is not configured",
-        )
-
-    if engine is None:
-        logger.error(
-            "DATABASE_URL is not configured"
-        )
-
-        return error_response(
-            status_code=500,
-            status="configuration_error",
-            error="DATABASE_URL is not configured",
-        )
 
     graph = getattr(
         request.app.state,
@@ -717,19 +878,28 @@ async def receive_drift_webhook(
         None,
     )
 
-    if graph is None:
+    redis_client: Redis | None = getattr(
+        request.app.state,
+        "redis_client",
+        None,
+    )
+
+    # These should never be unavailable after successful startup, but the
+    # defensive check avoids an unstructured exception during shutdown or
+    # abnormal lifecycle states.
+    if graph is None or redis_client is None:
         logger.error(
-            "LangGraph investigation graph is unavailable"
+            "Agent infrastructure is unavailable"
         )
 
         return error_response(
             status_code=500,
-            status="configuration_error",
-            error="Checkpoint persistence is unavailable",
+            status="infrastructure_unavailable",
+            error="Agent infrastructure is unavailable",
         )
 
     # ------------------------------------------------------------------
-    # Authenticate raw request bytes
+    # Authenticate exact raw bytes
     # ------------------------------------------------------------------
 
     payload_bytes = await request.body()
@@ -749,9 +919,10 @@ async def receive_drift_webhook(
             error="Missing webhook signature",
         )
 
+    # DRIFT_WEBHOOK_SECRET is guaranteed by lifespan validation.
     expected_signature = create_signature(
         payload_bytes,
-        DRIFT_WEBHOOK_SECRET,
+        DRIFT_WEBHOOK_SECRET,  # type: ignore[arg-type]
     )
 
     if not hmac.compare_digest(
@@ -769,15 +940,20 @@ async def receive_drift_webhook(
         )
 
     # ------------------------------------------------------------------
-    # Parse only after authentication
+    # Parse only after authenticity is established
     # ------------------------------------------------------------------
 
     try:
-        payload = json.loads(payload_bytes)
+        payload = json.loads(
+            payload_bytes
+        )
 
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+    ):
         logger.warning(
-            "Rejected authenticated webhook because body "
+            "Rejected authenticated webhook because its body "
             "was invalid JSON"
         )
 
@@ -789,7 +965,7 @@ async def receive_drift_webhook(
 
     if not isinstance(payload, dict):
         logger.warning(
-            "Rejected authenticated webhook because JSON "
+            "Rejected authenticated webhook because its JSON "
             "body was not an object"
         )
 
@@ -838,17 +1014,17 @@ async def receive_drift_webhook(
             error="Could not create investigation",
         )
 
-    # ------------------------------------------------------------------
-    # Duplicate webhook: do not invoke graph again
-    # ------------------------------------------------------------------
-
+    # Duplicate webhook deliveries must not recreate checkpoints or jobs.
     if not result.created:
         return WebhookResponse(
             status="duplicate",
             report_id=result.report_id,
         )
 
-    if not result.investigation_id or not result.thread_id:
+    if (
+        not result.investigation_id
+        or not result.thread_id
+    ):
         logger.error(
             "Investigation creation returned incomplete identity: "
             "report_id=%s",
@@ -892,7 +1068,7 @@ async def receive_drift_webhook(
 
         except Exception:
             logger.exception(
-                "Failed to mark investigation checkpoint failure: "
+                "Failed to mark checkpoint failure: "
                 "investigation_id=%s",
                 result.investigation_id,
             )
@@ -900,20 +1076,81 @@ async def receive_drift_webhook(
         return error_response(
             status_code=500,
             status="checkpoint_error",
-            error="Investigation was created, but checkpoint persistence failed",
+            error=(
+                "Investigation was created, but checkpoint "
+                "persistence failed"
+            ),
         )
 
-    # Success intentionally leaves investigations.status = "open".
+    # ------------------------------------------------------------------
+    # Dispatch retrain job
+    # ------------------------------------------------------------------
+
+    retrain_job_id = generate_retrain_job_id()
+
+    try:
+        stream_entry_id = await run_in_threadpool(
+            dispatch_retrain_job,
+            redis_client=redis_client,
+            retrain_job_id=retrain_job_id,
+            investigation_id=result.investigation_id,
+            report_id=result.report_id,
+            model_name=investigation_input.model_name,
+            source_model_version=(
+                investigation_input.model_version
+            ),
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to dispatch retrain job: "
+            "retrain_job_id=%s investigation_id=%s report_id=%s",
+            retrain_job_id,
+            result.investigation_id,
+            result.report_id,
+        )
+
+        try:
+            await run_in_threadpool(
+                update_investigation_status,
+                result.investigation_id,
+                "dispatch_failed",
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to mark dispatch failure: "
+                "investigation_id=%s",
+                result.investigation_id,
+            )
+
+        return error_response(
+            status_code=500,
+            status="dispatch_error",
+            error=(
+                "Investigation and checkpoint were created, "
+                "but retrain job dispatch failed"
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Success
+    # ------------------------------------------------------------------
+
     logger.info(
-        "Created investigation and persisted checkpoint: "
-        "investigation_id=%s thread_id=%s report_id=%s",
+        "Investigation initialized and retrain job dispatched: "
+        "investigation_id=%s thread_id=%s report_id=%s "
+        "retrain_job_id=%s stream_entry_id=%s",
         result.investigation_id,
         result.thread_id,
         result.report_id,
+        retrain_job_id,
+        stream_entry_id,
     )
 
     return WebhookResponse(
         status="accepted",
         report_id=result.report_id,
         investigation_id=result.investigation_id,
+        retrain_job_id=retrain_job_id,
     )
