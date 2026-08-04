@@ -1,0 +1,132 @@
+services:
+  postgres:
+    image: postgres:16
+
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: drift_triage
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U postgres -d drift_triage",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+
+    ports:
+      - "6379:6379"
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "redis-cli",
+          "ping",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: .
+      dockerfile: migrations/Dockerfile
+
+    environment:
+      DATABASE_URL: >-
+        postgresql+psycopg://postgres:postgres@postgres:5432/drift_triage
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    restart: "no"
+
+  agent:
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+
+    environment:
+      DRIFT_WEBHOOK_SECRET: ${DRIFT_WEBHOOK_SECRET:?Please set DRIFT_WEBHOOK_SECRET in .env}
+
+      DATABASE_URL: >-
+        postgresql+psycopg://postgres:postgres@postgres:5432/drift_triage
+
+      LANGGRAPH_DATABASE_URL: >-
+        postgresql://postgres:postgres@postgres:5432/drift_triage
+
+      REDIS_URL: redis://redis:6379/0
+      RETRAIN_JOB_STREAM: async-tools:retrain
+
+    ports:
+      - "8001:8001"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+      redis:
+        condition: service_healthy
+
+      migrate:
+        condition: service_completed_successfully
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=2)",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+    restart: unless-stopped
+
+  model_service:
+    build:
+      context: .
+      dockerfile: model_service/Dockerfile
+
+    environment:
+      DRIFT_WEBHOOK_SECRET: ${DRIFT_WEBHOOK_SECRET:?Please set DRIFT_WEBHOOK_SECRET in .env}
+      AGENT_WEBHOOK_URL: http://agent:8001/webhooks/drift
+      AGENT_REQUEST_TIMEOUT_SECONDS: "5"
+
+    ports:
+      - "8020:8000"
+
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+      agent:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
