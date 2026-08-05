@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Quality and Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      DRIFT_WEBHOOK_SECRET: ci-only-shared-secret
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            model_service/requirements.txt
+            agent/requirements.txt
+            worker/requirements.txt
+            dashboard/requirements.txt
+            migrations/requirements.txt
+
+      - name: Install test and service dependencies
+        run: |
+          set -euo pipefail
+
+          python -m pip install --upgrade pip
+          python -m pip install ruff pytest
+
+          python -m pip install \
+            -r model_service/requirements.txt \
+            -r agent/requirements.txt \
+            -r worker/requirements.txt \
+            -r dashboard/requirements.txt
+
+      - name: Validate Docker Compose configuration
+        run: |
+          docker compose config --quiet
+
+      - name: Run Ruff lint checks
+        run: |
+          ruff check .
+
+      - name: Run Ruff formatting check
+        run: |
+          ruff format --check .
+
+      - name: Run unit tests
+        run: |
+          pytest tests/unit \
+            --verbose \
+            --showlocals \
+            --strict-markers
+
+      - name: Run end-to-end smoke test
+        run: |
+          bash tests/integration/smoke_test.sh
+
+      - name: Upload smoke-test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-artifacts
+          path: test-artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
