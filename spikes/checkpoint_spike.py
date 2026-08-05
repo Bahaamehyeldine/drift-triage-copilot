@@ -1,6 +1,7 @@
 from typing import TypedDict
-from langgraph.graph import StateGraph, START, END
+
 from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.graph import END, START, StateGraph
 
 DB_URI = "postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable"
 

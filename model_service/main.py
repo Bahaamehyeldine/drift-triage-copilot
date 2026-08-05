@@ -1,4 +1,3 @@
-
 # model_service/main.py
 
 import hashlib
@@ -6,14 +5,13 @@ import hmac
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,9 +29,7 @@ AGENT_WEBHOOK_URL = os.getenv(
 
 DRIFT_WEBHOOK_SECRET = os.getenv("DRIFT_WEBHOOK_SECRET")
 
-AGENT_REQUEST_TIMEOUT_SECONDS = float(
-    os.getenv("AGENT_REQUEST_TIMEOUT_SECONDS", "5")
-)
+AGENT_REQUEST_TIMEOUT_SECONDS = float(os.getenv("AGENT_REQUEST_TIMEOUT_SECONDS", "5"))
 
 
 class DriftDispatchResponse(BaseModel):
@@ -59,10 +55,7 @@ def build_drift_payload() -> dict[str, Any]:
     return {
         "schema_version": "1.0",
         "event_type": "drift.severity.increased",
-        "report_id": (
-            "drift-report-customer-churn-model-v12-"
-            "2026-07-22T12:00:00Z"
-        ),
+        "report_id": ("drift-report-customer-churn-model-v12-2026-07-22T12:00:00Z"),
         "timestamp": "2026-07-22T12:00:00Z",
         "model": {
             "name": "customer-churn-model",
@@ -152,7 +145,7 @@ def error_response(
 async def health() -> dict[str, str]:
     return {
         "status": "ok",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
@@ -210,8 +203,7 @@ async def trigger_debug_drift() -> DriftDispatchResponse | JSONResponse:
 
     except httpx.HTTPStatusError as exc:
         logger.exception(
-            "Agent rejected drift webhook: "
-            "report_id=%s status_code=%s",
+            "Agent rejected drift webhook: report_id=%s status_code=%s",
             report_id,
             exc.response.status_code,
         )
@@ -244,8 +236,7 @@ async def trigger_debug_drift() -> DriftDispatchResponse | JSONResponse:
         )
 
     logger.info(
-        "Drift webhook delivered: "
-        "report_id=%s agent_status_code=%s",
+        "Drift webhook delivered: report_id=%s agent_status_code=%s",
         report_id,
         response.status_code,
     )
@@ -255,4 +246,3 @@ async def trigger_debug_drift() -> DriftDispatchResponse | JSONResponse:
         report_id=report_id,
         agent_status_code=response.status_code,
     )
-

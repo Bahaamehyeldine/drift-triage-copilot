@@ -1,13 +1,13 @@
-
 # dashboard/main.py
 
 from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Final, Mapping, Sequence
+from datetime import UTC, datetime
+from typing import Any, Final
 
 import pandas as pd
 import sqlalchemy as sa
@@ -15,15 +15,11 @@ import streamlit as st
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
-
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
 
-LOG_FORMAT: Final[str] = (
-    "%(asctime)s %(levelname)s %(name)s "
-    "%(message)s"
-)
+LOG_FORMAT: Final[str] = "%(asctime)s %(levelname)s %(name)s %(message)s"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,9 +57,7 @@ class Settings:
         database_url = os.getenv("DATABASE_URL", "").strip()
 
         if not database_url:
-            raise RuntimeError(
-                "DATABASE_URL is not configured"
-            )
+            raise RuntimeError("DATABASE_URL is not configured")
 
         return cls(
             database_url=database_url,
@@ -244,6 +238,7 @@ retrain_jobs = sa.Table(
 # Database infrastructure
 # -----------------------------------------------------------------------------
 
+
 @st.cache_resource(show_spinner=False)
 def create_database_engine(
     database_url: str,
@@ -255,9 +250,7 @@ def create_database_engine(
     is cached as a process-level resource rather than recreated on every
     refresh.
     """
-    logger.info(
-        "Initializing Dashboard database engine"
-    )
+    logger.info("Initializing Dashboard database engine")
 
     return sa.create_engine(
         database_url,
@@ -274,14 +267,13 @@ def verify_database_connection(
     Fail before rendering operational data if Postgres is unavailable.
     """
     with engine.connect() as connection:
-        connection.execute(
-            sa.text("SELECT 1")
-        )
+        connection.execute(sa.text("SELECT 1"))
 
 
 # -----------------------------------------------------------------------------
 # Query construction
 # -----------------------------------------------------------------------------
+
 
 def build_latest_jobs_subquery() -> sa.Subquery:
     """
@@ -293,9 +285,7 @@ def build_latest_jobs_subquery() -> sa.Subquery:
     job_rank = (
         sa.func.row_number()
         .over(
-            partition_by=(
-                retrain_jobs.c.investigation_id
-            ),
+            partition_by=(retrain_jobs.c.investigation_id),
             order_by=(
                 retrain_jobs.c.created_at.desc(),
                 retrain_jobs.c.retrain_job_id.desc(),
@@ -304,23 +294,16 @@ def build_latest_jobs_subquery() -> sa.Subquery:
         .label("job_rank")
     )
 
-    return (
-        sa.select(
-            retrain_jobs.c.retrain_job_id,
-            retrain_jobs.c.investigation_id,
-            retrain_jobs.c.job_status,
-            retrain_jobs.c.attempt_count,
-            retrain_jobs.c.resulting_model_version,
-            retrain_jobs.c.created_at.label(
-                "job_created_at"
-            ),
-            retrain_jobs.c.updated_at.label(
-                "job_updated_at"
-            ),
-            job_rank,
-        )
-        .subquery("ranked_retrain_jobs")
-    )
+    return sa.select(
+        retrain_jobs.c.retrain_job_id,
+        retrain_jobs.c.investigation_id,
+        retrain_jobs.c.job_status,
+        retrain_jobs.c.attempt_count,
+        retrain_jobs.c.resulting_model_version,
+        retrain_jobs.c.created_at.label("job_created_at"),
+        retrain_jobs.c.updated_at.label("job_updated_at"),
+        job_rank,
+    ).subquery("ranked_retrain_jobs")
 
 
 def build_investigation_query() -> sa.Select:
@@ -335,46 +318,23 @@ def build_investigation_query() -> sa.Select:
 
     return (
         sa.select(
-            investigations.c.investigation_id.label(
-                "investigation_id"
-            ),
-            investigations.c.model_name.label(
-                "model_name"
-            ),
-            investigations.c.model_version.label(
-                "model_version"
-            ),
-            investigations.c.current_report_id.label(
-                "report_id"
-            ),
-            investigations.c.status.label(
-                "investigation_status"
-            ),
-            investigations.c.current_severity.label(
-                "severity"
-            ),
-            latest_jobs.c.retrain_job_id.label(
-                "latest_job_id"
-            ),
-            latest_jobs.c.job_status.label(
-                "latest_job_status"
-            ),
-            latest_jobs.c.attempt_count.label(
-                "attempt_count"
-            ),
-            latest_jobs.c.resulting_model_version.label(
-                "resulting_model_version"
-            ),
-            investigations.c.updated_at.label(
-                "updated_at"
-            ),
+            investigations.c.investigation_id.label("investigation_id"),
+            investigations.c.model_name.label("model_name"),
+            investigations.c.model_version.label("model_version"),
+            investigations.c.current_report_id.label("report_id"),
+            investigations.c.status.label("investigation_status"),
+            investigations.c.current_severity.label("severity"),
+            latest_jobs.c.retrain_job_id.label("latest_job_id"),
+            latest_jobs.c.job_status.label("latest_job_status"),
+            latest_jobs.c.attempt_count.label("attempt_count"),
+            latest_jobs.c.resulting_model_version.label("resulting_model_version"),
+            investigations.c.updated_at.label("updated_at"),
         )
         .select_from(
             investigations.outerjoin(
                 latest_jobs,
                 sa.and_(
-                    latest_jobs.c.investigation_id
-                    == investigations.c.investigation_id,
+                    latest_jobs.c.investigation_id == investigations.c.investigation_id,
                     latest_jobs.c.job_rank == 1,
                 ),
             )
@@ -398,16 +358,9 @@ def load_investigations(
     statement = build_investigation_query()
 
     with engine.connect() as connection:
-        rows = (
-            connection.execute(statement)
-            .mappings()
-            .all()
-        )
+        rows = connection.execute(statement).mappings().all()
 
-    return [
-        dict(row)
-        for row in rows
-    ]
+    return [dict(row) for row in rows]
 
 
 # -----------------------------------------------------------------------------
@@ -445,14 +398,9 @@ def format_utc_timestamp(
         return str(value)
 
     if value.tzinfo is None:
-        value = value.replace(
-            tzinfo=timezone.utc
-        )
+        value = value.replace(tzinfo=UTC)
 
-    return (
-        value.astimezone(timezone.utc)
-        .strftime("%Y-%m-%d %H:%M:%S UTC")
-    )
+    return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def build_dataframe(
@@ -461,39 +409,23 @@ def build_dataframe(
     """
     Convert database rows into the stable, human-facing table schema.
     """
-    internal_columns = list(
-        DISPLAY_COLUMNS.keys()
-    )
+    internal_columns = list(DISPLAY_COLUMNS.keys())
 
     if not rows:
-        return pd.DataFrame(
-            columns=list(
-                DISPLAY_COLUMNS.values()
-            )
-        )
+        return pd.DataFrame(columns=list(DISPLAY_COLUMNS.values()))
 
     dataframe = pd.DataFrame(
         rows,
         columns=internal_columns,
     )
 
-    dataframe["updated_at"] = (
-        dataframe["updated_at"]
-        .map(format_utc_timestamp)
-    )
+    dataframe["updated_at"] = dataframe["updated_at"].map(format_utc_timestamp)
 
-    dataframe["attempt_count"] = (
-        dataframe["attempt_count"]
-        .astype("Int64")
-    )
+    dataframe["attempt_count"] = dataframe["attempt_count"].astype("Int64")
 
-    dataframe = dataframe.rename(
-        columns=DISPLAY_COLUMNS
-    )
+    dataframe = dataframe.rename(columns=DISPLAY_COLUMNS)
 
-    return dataframe.fillna(
-        EMPTY_VALUE
-    )
+    return dataframe.fillna(EMPTY_VALUE)
 
 
 @dataclass(frozen=True)
@@ -515,13 +447,9 @@ def calculate_metrics(
             completed_jobs=0,
         )
 
-    statuses = dataframe[
-        "Investigation Status"
-    ]
+    statuses = dataframe["Investigation Status"]
 
-    job_statuses = dataframe[
-        "Latest Job Status"
-    ]
+    job_statuses = dataframe["Latest Job Status"]
 
     blocked_statuses = {
         "checkpoint_failed",
@@ -530,29 +458,16 @@ def calculate_metrics(
 
     return DashboardMetrics(
         investigations=len(dataframe),
-        open_investigations=int(
-            (
-                statuses
-                == INVESTIGATION_STATUS_OPEN
-            ).sum()
-        ),
-        blocked_investigations=int(
-            statuses.isin(
-                blocked_statuses
-            ).sum()
-        ),
-        completed_jobs=int(
-            (
-                job_statuses
-                == JOB_STATUS_COMPLETED
-            ).sum()
-        ),
+        open_investigations=int((statuses == INVESTIGATION_STATUS_OPEN).sum()),
+        blocked_investigations=int(statuses.isin(blocked_statuses).sum()),
+        completed_jobs=int((job_statuses == JOB_STATUS_COMPLETED).sum()),
     )
 
 
 # -----------------------------------------------------------------------------
 # Streamlit rendering
 # -----------------------------------------------------------------------------
+
 
 def render_header() -> None:
     st.title(APP_TITLE)
@@ -682,20 +597,15 @@ def render_investigation_table(
 
 
 def render_last_refresh_time() -> None:
-    refreshed_at = datetime.now(
-        timezone.utc
-    ).strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
-    )
+    refreshed_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    st.caption(
-        f"Last refreshed: {refreshed_at}"
-    )
+    st.caption(f"Last refreshed: {refreshed_at}")
 
 
 # -----------------------------------------------------------------------------
 # Application entrypoint
 # -----------------------------------------------------------------------------
+
 
 def main() -> None:
     st.set_page_config(
@@ -718,17 +628,11 @@ def main() -> None:
 
     try:
         settings = Settings.from_environment()
-        engine = create_database_engine(
-            settings.database_url
-        )
+        engine = create_database_engine(settings.database_url)
 
-        verify_database_connection(
-            engine
-        )
+        verify_database_connection(engine)
 
-        rows = load_investigations(
-            engine
-        )
+        rows = load_investigations(engine)
 
     except RuntimeError as exc:
         logger.error(
@@ -737,29 +641,20 @@ def main() -> None:
         )
 
         st.error(
-            "Dashboard configuration is incomplete. "
-            "Check the service logs for details."
+            "Dashboard configuration is incomplete. Check the service logs for details."
         )
 
         st.stop()
 
     except SQLAlchemyError:
-        logger.exception(
-            "Database operation failed while loading "
-            "Dashboard data"
-        )
+        logger.exception("Database operation failed while loading Dashboard data")
 
-        st.error(
-            "Postgres is currently unavailable or the "
-            "Dashboard query failed."
-        )
+        st.error("Postgres is currently unavailable or the Dashboard query failed.")
 
         st.stop()
 
     except Exception:
-        logger.exception(
-            "Unexpected Dashboard failure"
-        )
+        logger.exception("Unexpected Dashboard failure")
 
         st.error(
             "The Dashboard encountered an unexpected error. "
@@ -768,27 +663,18 @@ def main() -> None:
 
         st.stop()
 
-    dataframe = build_dataframe(
-        rows
-    )
+    dataframe = build_dataframe(rows)
 
-    metrics = calculate_metrics(
-        dataframe
-    )
+    metrics = calculate_metrics(dataframe)
 
-    render_metrics(
-        metrics
-    )
+    render_metrics(metrics)
 
     st.divider()
 
-    render_investigation_table(
-        dataframe
-    )
+    render_investigation_table(dataframe)
 
     render_last_refresh_time()
 
 
 if __name__ == "__main__":
     main()
-

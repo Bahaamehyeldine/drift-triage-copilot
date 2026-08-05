@@ -20,7 +20,6 @@ from pydantic import BaseModel
 from redis import Redis
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -52,6 +51,7 @@ RETRAIN_JOB_STREAM = os.getenv(
 # LangGraph state
 # ---------------------------------------------------------------------------
 
+
 class InvestigationGraphState(TypedDict):
     """
     Minimal workflow state persisted for one investigation.
@@ -78,8 +78,7 @@ def initialize_investigation(
     workflow. Real triage, action, and communication logic is deferred.
     """
     logger.info(
-        "Initializing investigation workflow: "
-        "investigation_id=%s report_id=%s",
+        "Initializing investigation workflow: investigation_id=%s report_id=%s",
         state["investigation_id"],
         state["report_id"],
     )
@@ -274,6 +273,7 @@ engine = (
 # Application lifecycle
 # ---------------------------------------------------------------------------
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -290,22 +290,15 @@ async def lifespan(app: FastAPI):
         "REDIS_URL": REDIS_URL,
     }
 
-    missing_config = [
-        name
-        for name, value in required_config.items()
-        if not value
-    ]
+    missing_config = [name for name, value in required_config.items() if not value]
 
     if missing_config:
         raise RuntimeError(
-            "Missing required Agent configuration: "
-            + ", ".join(missing_config)
+            "Missing required Agent configuration: " + ", ".join(missing_config)
         )
 
     if engine is None:
-        raise RuntimeError(
-            "SQLAlchemy engine was not initialized"
-        )
+        raise RuntimeError("SQLAlchemy engine was not initialized")
 
     redis_client: Redis | None = None
 
@@ -320,9 +313,7 @@ async def lifespan(app: FastAPI):
             check_database_connection,
         )
 
-        logger.info(
-            "Application database connection initialized"
-        )
+        logger.info("Application database connection initialized")
 
         # Create one Redis client for the application process.
         redis_client = redis.from_url(
@@ -343,25 +334,17 @@ async def lifespan(app: FastAPI):
 
         # PostgresSaver manages the checkpoint connection lifecycle inside
         # this context manager.
-        with PostgresSaver.from_conn_string(
-            LANGGRAPH_DATABASE_URL
-        ) as checkpointer:
+        with PostgresSaver.from_conn_string(LANGGRAPH_DATABASE_URL) as checkpointer:
             checkpointer.setup()
 
-            app.state.investigation_graph = (
-                build_investigation_graph(checkpointer)
-            )
+            app.state.investigation_graph = build_investigation_graph(checkpointer)
 
-            logger.info(
-                "LangGraph Postgres checkpointer initialized"
-            )
+            logger.info("LangGraph Postgres checkpointer initialized")
 
             yield
 
     except Exception:
-        logger.exception(
-            "Failed to initialize Agent infrastructure"
-        )
+        logger.exception("Failed to initialize Agent infrastructure")
         raise
 
     finally:
@@ -374,14 +357,10 @@ async def lifespan(app: FastAPI):
                     redis_client.close,
                 )
 
-                logger.info(
-                    "Redis connection closed"
-                )
+                logger.info("Redis connection closed")
 
             except Exception:
-                logger.exception(
-                    "Failed to close Redis client cleanly"
-                )
+                logger.exception("Failed to close Redis client cleanly")
 
         if engine is not None:
             try:
@@ -389,14 +368,10 @@ async def lifespan(app: FastAPI):
                     engine.dispose,
                 )
 
-                logger.info(
-                    "Application database engine disposed"
-                )
+                logger.info("Application database engine disposed")
 
             except Exception:
-                logger.exception(
-                    "Failed to dispose database engine cleanly"
-                )
+                logger.exception("Failed to dispose database engine cleanly")
 
 
 app = FastAPI(
@@ -409,6 +384,7 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 # API models
 # ---------------------------------------------------------------------------
+
 
 class WebhookResponse(BaseModel):
     status: str
@@ -440,6 +416,7 @@ class InvestigationCreationResult(BaseModel):
 # HMAC
 # ---------------------------------------------------------------------------
 
+
 def create_signature(
     payload_bytes: bytes,
     secret: str,
@@ -459,6 +436,7 @@ def create_signature(
 # ---------------------------------------------------------------------------
 # Response helpers
 # ---------------------------------------------------------------------------
+
 
 def error_response(
     *,
@@ -487,6 +465,7 @@ def error_response(
 # Payload validation
 # ---------------------------------------------------------------------------
 
+
 def extract_investigation_input(
     payload: dict[str, Any],
 ) -> InvestigationInput:
@@ -498,45 +477,27 @@ def extract_investigation_input(
     overall_severity = payload.get("overall_severity")
 
     if not isinstance(report_id, str) or not report_id.strip():
-        raise ValueError(
-            "Missing or invalid report_id"
-        )
+        raise ValueError("Missing or invalid report_id")
 
     if not isinstance(model, dict):
-        raise ValueError(
-            "Missing or invalid model"
-        )
+        raise ValueError("Missing or invalid model")
 
     model_name = model.get("name")
     model_version = model.get("version")
 
     if not isinstance(model_name, str) or not model_name.strip():
-        raise ValueError(
-            "Missing or invalid model.name"
-        )
+        raise ValueError("Missing or invalid model.name")
 
-    if (
-        not isinstance(model_version, str)
-        or not model_version.strip()
-    ):
-        raise ValueError(
-            "Missing or invalid model.version"
-        )
+    if not isinstance(model_version, str) or not model_version.strip():
+        raise ValueError("Missing or invalid model.version")
 
     if not isinstance(overall_severity, dict):
-        raise ValueError(
-            "Missing or invalid overall_severity"
-        )
+        raise ValueError("Missing or invalid overall_severity")
 
     current_severity = overall_severity.get("current")
 
-    if (
-        not isinstance(current_severity, str)
-        or not current_severity.strip()
-    ):
-        raise ValueError(
-            "Missing or invalid overall_severity.current"
-        )
+    if not isinstance(current_severity, str) or not current_severity.strip():
+        raise ValueError("Missing or invalid overall_severity.current")
 
     return InvestigationInput(
         report_id=report_id,
@@ -549,6 +510,7 @@ def extract_investigation_input(
 # ---------------------------------------------------------------------------
 # Model identity
 # ---------------------------------------------------------------------------
+
 
 def build_model_uri(
     model_name: str,
@@ -563,6 +525,7 @@ def build_model_uri(
 # ---------------------------------------------------------------------------
 # ID generation
 # ---------------------------------------------------------------------------
+
 
 def generate_investigation_id() -> str:
     return f"inv_{uuid.uuid4().hex}"
@@ -580,6 +543,7 @@ def generate_retrain_job_id() -> str:
 # Investigation persistence
 # ---------------------------------------------------------------------------
 
+
 def create_investigation_for_webhook(
     investigation_input: InvestigationInput,
 ) -> InvestigationCreationResult:
@@ -591,9 +555,7 @@ def create_investigation_for_webhook(
     they belong to separate transactional systems.
     """
     if engine is None:
-        raise RuntimeError(
-            "Database engine is unavailable"
-        )
+        raise RuntimeError("Database engine is unavailable")
 
     report_id = investigation_input.report_id
     investigation_id = generate_investigation_id()
@@ -619,28 +581,21 @@ def create_investigation_for_webhook(
         )
     )
 
-    investigation_insert = (
-        sa.insert(investigations)
-        .values(
-            investigation_id=investigation_id,
-            thread_id=thread_id,
-            model_name=investigation_input.model_name,
-            model_version=investigation_input.model_version,
-            model_uri=model_uri,
-            triggering_report_id=report_id,
-            current_report_id=report_id,
-            status="open",
-            current_severity=(
-                investigation_input.current_severity
-            ),
-        )
+    investigation_insert = sa.insert(investigations).values(
+        investigation_id=investigation_id,
+        thread_id=thread_id,
+        model_name=investigation_input.model_name,
+        model_version=investigation_input.model_version,
+        model_uri=model_uri,
+        triggering_report_id=report_id,
+        current_report_id=report_id,
+        status="open",
+        current_severity=(investigation_input.current_severity),
     )
 
     receipt_update = (
         sa.update(webhook_receipts)
-        .where(
-            webhook_receipts.c.report_id == report_id
-        )
+        .where(webhook_receipts.c.report_id == report_id)
         .values(
             investigation_id=investigation_id,
             processing_status="processed",
@@ -649,9 +604,7 @@ def create_investigation_for_webhook(
     )
 
     with engine.begin() as connection:
-        inserted_report_id = connection.execute(
-            receipt_insert
-        ).scalar_one_or_none()
+        inserted_report_id = connection.execute(receipt_insert).scalar_one_or_none()
 
         if inserted_report_id is None:
             logger.info(
@@ -664,13 +617,9 @@ def create_investigation_for_webhook(
                 report_id=report_id,
             )
 
-        connection.execute(
-            investigation_insert
-        )
+        connection.execute(investigation_insert)
 
-        receipt_update_result = connection.execute(
-            receipt_update
-        )
+        receipt_update_result = connection.execute(receipt_update)
 
         if receipt_update_result.rowcount != 1:
             raise RuntimeError(
@@ -698,16 +647,11 @@ def update_investigation_status(
     only during INSERT.
     """
     if engine is None:
-        raise RuntimeError(
-            "Database engine is unavailable"
-        )
+        raise RuntimeError("Database engine is unavailable")
 
     statement = (
         sa.update(investigations)
-        .where(
-            investigations.c.investigation_id
-            == investigation_id
-        )
+        .where(investigations.c.investigation_id == investigation_id)
         .values(
             status=status,
             updated_at=sa.func.now(),
@@ -715,9 +659,7 @@ def update_investigation_status(
     )
 
     with engine.begin() as connection:
-        result = connection.execute(
-            statement
-        )
+        result = connection.execute(statement)
 
         if result.rowcount != 1:
             raise RuntimeError(
@@ -730,6 +672,7 @@ def update_investigation_status(
 # ---------------------------------------------------------------------------
 # LangGraph checkpoint persistence
 # ---------------------------------------------------------------------------
+
 
 def persist_initial_checkpoint(
     *,
@@ -766,6 +709,7 @@ def persist_initial_checkpoint(
 # Redis dispatch
 # ---------------------------------------------------------------------------
 
+
 def dispatch_retrain_job(
     *,
     redis_client: Redis,
@@ -797,9 +741,7 @@ def dispatch_retrain_job(
     )
 
     if not stream_entry_id:
-        raise RuntimeError(
-            "Redis XADD did not return a stream entry ID"
-        )
+        raise RuntimeError("Redis XADD did not return a stream entry ID")
 
     return str(stream_entry_id)
 
@@ -807,6 +749,7 @@ def dispatch_retrain_job(
 # ---------------------------------------------------------------------------
 # Health endpoint
 # ---------------------------------------------------------------------------
+
 
 @app.get("/health")
 async def health(request: Request) -> dict[str, str]:
@@ -836,6 +779,7 @@ async def health(request: Request) -> dict[str, str]:
 # Drift webhook endpoint
 # ---------------------------------------------------------------------------
 
+
 @app.post(
     "/webhooks/drift",
     response_model=WebhookResponse,
@@ -850,9 +794,7 @@ async def health(request: Request) -> dict[str, str]:
         },
         500: {
             "model": ErrorResponse,
-            "description": (
-                "Persistence, checkpoint, or queue dispatch failure"
-            ),
+            "description": ("Persistence, checkpoint, or queue dispatch failure"),
         },
     },
 )
@@ -888,9 +830,7 @@ async def receive_drift_webhook(
     # defensive check avoids an unstructured exception during shutdown or
     # abnormal lifecycle states.
     if graph is None or redis_client is None:
-        logger.error(
-            "Agent infrastructure is unavailable"
-        )
+        logger.error("Agent infrastructure is unavailable")
 
         return error_response(
             status_code=500,
@@ -904,14 +844,10 @@ async def receive_drift_webhook(
 
     payload_bytes = await request.body()
 
-    received_signature = request.headers.get(
-        "X-Webhook-Signature"
-    )
+    received_signature = request.headers.get("X-Webhook-Signature")
 
     if not received_signature:
-        logger.warning(
-            "Rejected drift webhook with missing signature"
-        )
+        logger.warning("Rejected drift webhook with missing signature")
 
         return error_response(
             status_code=401,
@@ -929,9 +865,7 @@ async def receive_drift_webhook(
         expected_signature,
         received_signature,
     ):
-        logger.warning(
-            "Rejected drift webhook with invalid signature"
-        )
+        logger.warning("Rejected drift webhook with invalid signature")
 
         return error_response(
             status_code=401,
@@ -944,17 +878,14 @@ async def receive_drift_webhook(
     # ------------------------------------------------------------------
 
     try:
-        payload = json.loads(
-            payload_bytes
-        )
+        payload = json.loads(payload_bytes)
 
     except (
         json.JSONDecodeError,
         UnicodeDecodeError,
     ):
         logger.warning(
-            "Rejected authenticated webhook because its body "
-            "was invalid JSON"
+            "Rejected authenticated webhook because its body was invalid JSON"
         )
 
         return error_response(
@@ -965,8 +896,7 @@ async def receive_drift_webhook(
 
     if not isinstance(payload, dict):
         logger.warning(
-            "Rejected authenticated webhook because its JSON "
-            "body was not an object"
+            "Rejected authenticated webhook because its JSON body was not an object"
         )
 
         return error_response(
@@ -976,9 +906,7 @@ async def receive_drift_webhook(
         )
 
     try:
-        investigation_input = extract_investigation_input(
-            payload
-        )
+        investigation_input = extract_investigation_input(payload)
 
     except ValueError as exc:
         logger.warning(
@@ -1021,13 +949,9 @@ async def receive_drift_webhook(
             report_id=result.report_id,
         )
 
-    if (
-        not result.investigation_id
-        or not result.thread_id
-    ):
+    if not result.investigation_id or not result.thread_id:
         logger.error(
-            "Investigation creation returned incomplete identity: "
-            "report_id=%s",
+            "Investigation creation returned incomplete identity: report_id=%s",
             result.report_id,
         )
 
@@ -1068,18 +992,14 @@ async def receive_drift_webhook(
 
         except Exception:
             logger.exception(
-                "Failed to mark checkpoint failure: "
-                "investigation_id=%s",
+                "Failed to mark checkpoint failure: investigation_id=%s",
                 result.investigation_id,
             )
 
         return error_response(
             status_code=500,
             status="checkpoint_error",
-            error=(
-                "Investigation was created, but checkpoint "
-                "persistence failed"
-            ),
+            error=("Investigation was created, but checkpoint persistence failed"),
         )
 
     # ------------------------------------------------------------------
@@ -1096,9 +1016,7 @@ async def receive_drift_webhook(
             investigation_id=result.investigation_id,
             report_id=result.report_id,
             model_name=investigation_input.model_name,
-            source_model_version=(
-                investigation_input.model_version
-            ),
+            source_model_version=(investigation_input.model_version),
         )
 
     except Exception:
@@ -1119,8 +1037,7 @@ async def receive_drift_webhook(
 
         except Exception:
             logger.exception(
-                "Failed to mark dispatch failure: "
-                "investigation_id=%s",
+                "Failed to mark dispatch failure: investigation_id=%s",
                 result.investigation_id,
             )
 

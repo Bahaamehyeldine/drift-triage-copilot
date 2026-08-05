@@ -4,15 +4,14 @@ import logging
 import os
 import signal
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 import redis
 import sqlalchemy as sa
 from redis import Redis
 from redis.exceptions import ResponseError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -48,13 +47,9 @@ RETRAIN_CONSUMER_NAME = os.getenv(
     "worker-1",
 )
 
-REDIS_BLOCK_MS = int(
-    os.getenv("REDIS_BLOCK_MS", "5000")
-)
+REDIS_BLOCK_MS = int(os.getenv("REDIS_BLOCK_MS", "5000"))
 
-STUB_EXECUTION_SECONDS = float(
-    os.getenv("STUB_EXECUTION_SECONDS", "1")
-)
+STUB_EXECUTION_SECONDS = float(os.getenv("STUB_EXECUTION_SECONDS", "1"))
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +141,7 @@ retrain_jobs = sa.Table(
 # Internal models
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class RetrainJobMessage:
     retrain_job_id: str
@@ -186,6 +182,7 @@ def request_shutdown(
 # Configuration validation
 # ---------------------------------------------------------------------------
 
+
 def validate_configuration() -> None:
     missing = [
         name
@@ -198,30 +195,24 @@ def validate_configuration() -> None:
 
     if missing:
         raise RuntimeError(
-            "Missing required Worker configuration: "
-            + ", ".join(missing)
+            "Missing required Worker configuration: " + ", ".join(missing)
         )
 
     if REDIS_BLOCK_MS <= 0:
-        raise RuntimeError(
-            "REDIS_BLOCK_MS must be greater than zero"
-        )
+        raise RuntimeError("REDIS_BLOCK_MS must be greater than zero")
 
     if STUB_EXECUTION_SECONDS < 0:
-        raise RuntimeError(
-            "STUB_EXECUTION_SECONDS cannot be negative"
-        )
+        raise RuntimeError("STUB_EXECUTION_SECONDS cannot be negative")
 
 
 # ---------------------------------------------------------------------------
 # Infrastructure
 # ---------------------------------------------------------------------------
 
+
 def create_database_engine() -> sa.Engine:
     if not DATABASE_URL:
-        raise RuntimeError(
-            "DATABASE_URL is not configured"
-        )
+        raise RuntimeError("DATABASE_URL is not configured")
 
     return sa.create_engine(
         DATABASE_URL,
@@ -231,9 +222,7 @@ def create_database_engine() -> sa.Engine:
 
 def create_redis_client() -> Redis:
     if not REDIS_URL:
-        raise RuntimeError(
-            "REDIS_URL is not configured"
-        )
+        raise RuntimeError("REDIS_URL is not configured")
 
     return redis.from_url(
         REDIS_URL,
@@ -245,9 +234,7 @@ def verify_database_connection(
     engine: sa.Engine,
 ) -> None:
     with engine.connect() as connection:
-        connection.execute(
-            sa.text("SELECT 1")
-        )
+        connection.execute(sa.text("SELECT 1"))
 
 
 def ensure_consumer_group(
@@ -269,8 +256,7 @@ def ensure_consumer_group(
         )
 
         logger.info(
-            "Created Redis consumer group: "
-            "stream=%s group=%s",
+            "Created Redis consumer group: stream=%s group=%s",
             RETRAIN_JOB_STREAM,
             RETRAIN_CONSUMER_GROUP,
         )
@@ -280,8 +266,7 @@ def ensure_consumer_group(
             raise
 
         logger.info(
-            "Redis consumer group already exists: "
-            "stream=%s group=%s",
+            "Redis consumer group already exists: stream=%s group=%s",
             RETRAIN_JOB_STREAM,
             RETRAIN_CONSUMER_GROUP,
         )
@@ -291,6 +276,7 @@ def ensure_consumer_group(
 # Message validation
 # ---------------------------------------------------------------------------
 
+
 def require_message_field(
     fields: Mapping[str, str],
     field_name: str,
@@ -298,9 +284,7 @@ def require_message_field(
     value = fields.get(field_name)
 
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(
-            f"Missing or invalid stream field: {field_name}"
-        )
+        raise ValueError(f"Missing or invalid stream field: {field_name}")
 
     return value
 
@@ -314,9 +298,7 @@ def parse_retrain_job_message(
     )
 
     if job_type != "retrain":
-        raise ValueError(
-            f"Unsupported job_type: {job_type}"
-        )
+        raise ValueError(f"Unsupported job_type: {job_type}")
 
     return RetrainJobMessage(
         retrain_job_id=require_message_field(
@@ -346,6 +328,7 @@ def parse_retrain_job_message(
 # Durable idempotency claim
 # ---------------------------------------------------------------------------
 
+
 def claim_retrain_job(
     engine: sa.Engine,
     job: RetrainJobMessage,
@@ -355,7 +338,7 @@ def claim_retrain_job(
 
     PostgreSQL's primary-key constraint on retrain_job_id is the durable
     idempotency boundary. ON CONFLICT DO NOTHING ensures that concurrent
-    workers cannot both claim the same logical job. :contentReference[oaicite:1]{index=1}
+    workers cannot both claim the same logical job.
     """
     statement = (
         pg_insert(retrain_jobs)
@@ -380,9 +363,7 @@ def claim_retrain_job(
     )
 
     with engine.begin() as connection:
-        claimed_job_id = connection.execute(
-            statement
-        ).scalar_one_or_none()
+        claimed_job_id = connection.execute(statement).scalar_one_or_none()
 
         if claimed_job_id is not None:
             return JobClaimResult(
@@ -392,10 +373,7 @@ def claim_retrain_job(
         existing_status = connection.execute(
             sa.select(
                 retrain_jobs.c.job_status,
-            ).where(
-                retrain_jobs.c.retrain_job_id
-                == job.retrain_job_id
-            )
+            ).where(retrain_jobs.c.retrain_job_id == job.retrain_job_id)
         ).scalar_one_or_none()
 
     return JobClaimResult(
@@ -408,6 +386,7 @@ def claim_retrain_job(
 # Stub execution
 # ---------------------------------------------------------------------------
 
+
 def execute_stub_retraining(
     job: RetrainJobMessage,
 ) -> str:
@@ -419,21 +398,16 @@ def execute_stub_retraining(
     path can be verified.
     """
     logger.info(
-        "Executing stub retraining: "
-        "retrain_job_id=%s model=%s source_version=%s",
+        "Executing stub retraining: retrain_job_id=%s model=%s source_version=%s",
         job.retrain_job_id,
         job.model_name,
         job.source_model_version,
     )
 
     if STUB_EXECUTION_SECONDS:
-        time.sleep(
-            STUB_EXECUTION_SECONDS
-        )
+        time.sleep(STUB_EXECUTION_SECONDS)
 
-    return (
-        f"stub-{job.source_model_version}-retrained"
-    )
+    return f"stub-{job.source_model_version}-retrained"
 
 
 def mark_job_completed(
@@ -444,29 +418,19 @@ def mark_job_completed(
 ) -> None:
     statement = (
         sa.update(retrain_jobs)
-        .where(
-            retrain_jobs.c.retrain_job_id
-            == retrain_job_id
-        )
-        .where(
-            retrain_jobs.c.job_status
-            == "running"
-        )
+        .where(retrain_jobs.c.retrain_job_id == retrain_job_id)
+        .where(retrain_jobs.c.job_status == "running")
         .values(
             job_status="completed",
             completed_at=sa.func.now(),
-            resulting_model_version=(
-                resulting_model_version
-            ),
+            resulting_model_version=(resulting_model_version),
             failure_details=None,
             updated_at=sa.func.now(),
         )
     )
 
     with engine.begin() as connection:
-        result = connection.execute(
-            statement
-        )
+        result = connection.execute(statement)
 
         if result.rowcount != 1:
             raise RuntimeError(
@@ -484,14 +448,8 @@ def mark_job_failed(
 ) -> None:
     statement = (
         sa.update(retrain_jobs)
-        .where(
-            retrain_jobs.c.retrain_job_id
-            == retrain_job_id
-        )
-        .where(
-            retrain_jobs.c.job_status
-            == "running"
-        )
+        .where(retrain_jobs.c.retrain_job_id == retrain_job_id)
+        .where(retrain_jobs.c.job_status == "running")
         .values(
             job_status="failed",
             completed_at=sa.func.now(),
@@ -501,9 +459,7 @@ def mark_job_failed(
     )
 
     with engine.begin() as connection:
-        result = connection.execute(
-            statement
-        )
+        result = connection.execute(statement)
 
         if result.rowcount != 1:
             raise RuntimeError(
@@ -516,6 +472,7 @@ def mark_job_failed(
 # ---------------------------------------------------------------------------
 # Redis acknowledgment
 # ---------------------------------------------------------------------------
+
 
 def acknowledge_message(
     redis_client: Redis,
@@ -539,6 +496,7 @@ def acknowledge_message(
 # Message processing
 # ---------------------------------------------------------------------------
 
+
 def process_message(
     *,
     engine: sa.Engine,
@@ -547,14 +505,11 @@ def process_message(
     fields: Mapping[str, str],
 ) -> None:
     try:
-        job = parse_retrain_job_message(
-            fields
-        )
+        job = parse_retrain_job_message(fields)
 
     except ValueError:
         logger.exception(
-            "Invalid retrain stream message left pending: "
-            "message_id=%s fields=%s",
+            "Invalid retrain stream message left pending: message_id=%s fields=%s",
             message_id,
             dict(fields),
         )
@@ -623,16 +578,12 @@ def process_message(
     # ------------------------------------------------------------------
 
     try:
-        resulting_model_version = (
-            execute_stub_retraining(job)
-        )
+        resulting_model_version = execute_stub_retraining(job)
 
         mark_job_completed(
             engine,
             retrain_job_id=job.retrain_job_id,
-            resulting_model_version=(
-                resulting_model_version
-            ),
+            resulting_model_version=(resulting_model_version),
         )
 
     except Exception as exc:
@@ -653,8 +604,7 @@ def process_message(
 
         except Exception:
             logger.exception(
-                "Failed to persist retrain job failure: "
-                "retrain_job_id=%s",
+                "Failed to persist retrain job failure: retrain_job_id=%s",
                 job.retrain_job_id,
             )
 
@@ -692,6 +642,7 @@ def process_message(
 # Consumer loop
 # ---------------------------------------------------------------------------
 
+
 def consume_forever(
     *,
     engine: sa.Engine,
@@ -717,9 +668,7 @@ def consume_forever(
             )
 
         except Exception:
-            logger.exception(
-                "Redis stream read failed; retrying"
-            )
+            logger.exception("Redis stream read failed; retrying")
             time.sleep(1)
             continue
 
@@ -740,6 +689,7 @@ def consume_forever(
 # Entrypoint
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     validate_configuration()
 
@@ -756,18 +706,12 @@ def main() -> None:
     redis_client = create_redis_client()
 
     try:
-        verify_database_connection(
-            engine
-        )
+        verify_database_connection(engine)
         redis_client.ping()
 
-        logger.info(
-            "Worker infrastructure connections verified"
-        )
+        logger.info("Worker infrastructure connections verified")
 
-        ensure_consumer_group(
-            redis_client
-        )
+        ensure_consumer_group(redis_client)
 
         consume_forever(
             engine=engine,
@@ -778,20 +722,14 @@ def main() -> None:
         try:
             redis_client.close()
         except Exception:
-            logger.exception(
-                "Failed to close Redis client cleanly"
-            )
+            logger.exception("Failed to close Redis client cleanly")
 
         try:
             engine.dispose()
         except Exception:
-            logger.exception(
-                "Failed to dispose database engine cleanly"
-            )
+            logger.exception("Failed to dispose database engine cleanly")
 
-        logger.info(
-            "Worker stopped"
-        )
+        logger.info("Worker stopped")
 
 
 if __name__ == "__main__":
