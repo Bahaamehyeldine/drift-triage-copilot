@@ -157,5 +157,24 @@ services:
 
     restart: unless-stopped
 
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+
+    environment:
+      DATABASE_URL: >-
+        postgresql+psycopg://postgres:postgres@postgres:5432/drift_triage
+
+    ports:
+      - "8520:8501"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+    restart: unless-stopped
 volumes:
   postgres_data:
