@@ -20,9 +20,7 @@ def test_create_signature_matches_known_hmac_sha256_vector() -> None:
     )
 
     assert signature == (
-        "sha256="
-        "f7bc83f430538424b13298e6aa6fb143"
-        "ef4d59a14946175997479dbc2d1a3cd8"
+        "sha256=f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
     )
 
 

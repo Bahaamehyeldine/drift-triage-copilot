@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -12,10 +12,10 @@ from dashboard.main import (
     format_utc_timestamp,
 )
 
-
 # -----------------------------------------------------------------------------
 # format_utc_timestamp
 # -----------------------------------------------------------------------------
+
 
 def test_format_utc_timestamp_returns_placeholder_for_none() -> None:
     result = format_utc_timestamp(None)
@@ -45,9 +45,7 @@ def test_format_utc_timestamp_treats_naive_datetime_as_utc() -> None:
 
 
 def test_format_utc_timestamp_converts_aware_datetime_to_utc() -> None:
-    beirut_offset = timezone(
-        timedelta(hours=3)
-    )
+    beirut_offset = timezone(timedelta(hours=3))
 
     value = datetime(
         2026,
@@ -72,7 +70,7 @@ def test_format_utc_timestamp_preserves_utc_datetime() -> None:
         9,
         30,
         45,
-        tzinfo=timezone.utc,
+        tzinfo=UTC,
     )
 
     result = format_utc_timestamp(value)
@@ -87,9 +85,7 @@ def test_format_utc_timestamp_stringifies_unexpected_value() -> None:
     The Dashboard remains resilient if a future query or driver returns an
     already-formatted value.
     """
-    result = format_utc_timestamp(
-        "2026-08-05T09:30:45Z"
-    )
+    result = format_utc_timestamp("2026-08-05T09:30:45Z")
 
     assert result == "2026-08-05T09:30:45Z"
 
@@ -103,6 +99,7 @@ def test_format_utc_timestamp_stringifies_numeric_value() -> None:
 # -----------------------------------------------------------------------------
 # calculate_metrics
 # -----------------------------------------------------------------------------
+
 
 def test_calculate_metrics_returns_zero_counts_for_empty_dataframe() -> None:
     dataframe = pd.DataFrame(
@@ -237,4 +234,3 @@ def test_calculate_metrics_counts_only_exact_status_matches() -> None:
         blocked_investigations=0,
         completed_jobs=1,
     )
-

@@ -13,10 +13,10 @@ from worker.main import (
     require_message_field,
 )
 
-
 # -----------------------------------------------------------------------------
 # Fixtures
 # -----------------------------------------------------------------------------
+
 
 @pytest.fixture
 def valid_retrain_message() -> dict[str, str]:
@@ -28,16 +28,9 @@ def valid_retrain_message() -> dict[str, str]:
     """
     return {
         "job_type": "retrain",
-        "retrain_job_id": (
-            "retrain_4e2e3f1f7e8d4d3e9a4e7f1c6b8a2d10"
-        ),
-        "investigation_id": (
-            "inv_2a4f6d8c0b1e4f5a9c3d7e8f1a2b4c6d"
-        ),
-        "report_id": (
-            "drift-report-customer-churn-model-v12-"
-            "2026-07-22T12:00:00Z"
-        ),
+        "retrain_job_id": ("retrain_4e2e3f1f7e8d4d3e9a4e7f1c6b8a2d10"),
+        "investigation_id": ("inv_2a4f6d8c0b1e4f5a9c3d7e8f1a2b4c6d"),
+        "report_id": ("drift-report-customer-churn-model-v12-2026-07-22T12:00:00Z"),
         "model_name": "customer-churn-model",
         "source_model_version": "12",
     }
@@ -46,6 +39,7 @@ def valid_retrain_message() -> dict[str, str]:
 # -----------------------------------------------------------------------------
 # require_message_field
 # -----------------------------------------------------------------------------
+
 
 def test_require_message_field_returns_valid_value() -> None:
     fields = {
@@ -91,9 +85,7 @@ def test_require_message_field_rejects_invalid_values(
 ) -> None:
     with pytest.raises(
         ValueError,
-        match=re.escape(
-            f"Missing or invalid stream field: {field_name}"
-        ),
+        match=re.escape(f"Missing or invalid stream field: {field_name}"),
     ):
         require_message_field(
             fields,
@@ -105,27 +97,21 @@ def test_require_message_field_rejects_invalid_values(
 # parse_retrain_job_message — success path
 # -----------------------------------------------------------------------------
 
+
 def test_parse_retrain_job_message_maps_all_fields(
     valid_retrain_message: dict[str, str],
 ) -> None:
-    result = parse_retrain_job_message(
-        valid_retrain_message
-    )
+    result = parse_retrain_job_message(valid_retrain_message)
 
     assert isinstance(
         result,
         RetrainJobMessage,
     )
 
-    assert result.retrain_job_id == (
-        "retrain_4e2e3f1f7e8d4d3e9a4e7f1c6b8a2d10"
-    )
-    assert result.investigation_id == (
-        "inv_2a4f6d8c0b1e4f5a9c3d7e8f1a2b4c6d"
-    )
+    assert result.retrain_job_id == ("retrain_4e2e3f1f7e8d4d3e9a4e7f1c6b8a2d10")
+    assert result.investigation_id == ("inv_2a4f6d8c0b1e4f5a9c3d7e8f1a2b4c6d")
     assert result.report_id == (
-        "drift-report-customer-churn-model-v12-"
-        "2026-07-22T12:00:00Z"
+        "drift-report-customer-churn-model-v12-2026-07-22T12:00:00Z"
     )
     assert result.model_name == "customer-churn-model"
     assert result.source_model_version == "12"
@@ -141,9 +127,7 @@ def test_parse_retrain_job_message_ignores_unrelated_stream_fields(
     valid_retrain_message["trace_id"] = "trace_abc123"
     valid_retrain_message["dispatch_attempt"] = "1"
 
-    result = parse_retrain_job_message(
-        valid_retrain_message
-    )
+    result = parse_retrain_job_message(valid_retrain_message)
 
     assert result.model_name == "customer-churn-model"
     assert result.source_model_version == "12"
@@ -285,9 +269,7 @@ def test_parse_retrain_job_message_rejects_missing_or_empty_fields(
     A None value is used to represent a missing or malformed decoded field.
     Deleting the key is preferable for the explicit missing-field cases.
     """
-    mutated_message: dict[str, Any] = dict(
-        valid_retrain_message
-    )
+    mutated_message: dict[str, Any] = dict(valid_retrain_message)
 
     if invalid_value is None:
         mutated_message.pop(
@@ -301,14 +283,13 @@ def test_parse_retrain_job_message_rejects_missing_or_empty_fields(
         ValueError,
         match=re.escape(expected_error),
     ):
-        parse_retrain_job_message(
-            mutated_message
-        )
+        parse_retrain_job_message(mutated_message)
 
 
 # -----------------------------------------------------------------------------
 # parse_retrain_job_message — job type contract
 # -----------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize(
     "unsupported_job_type",
@@ -335,16 +316,10 @@ def test_parse_retrain_job_message_rejects_unsupported_job_type(
     valid_retrain_message: dict[str, str],
     unsupported_job_type: str,
 ) -> None:
-    valid_retrain_message[
-        "job_type"
-    ] = unsupported_job_type
+    valid_retrain_message["job_type"] = unsupported_job_type
 
     with pytest.raises(
         ValueError,
-        match=re.escape(
-            f"Unsupported job_type: {unsupported_job_type}"
-        ),
+        match=re.escape(f"Unsupported job_type: {unsupported_job_type}"),
     ):
-        parse_retrain_job_message(
-            valid_retrain_message
-        )
+        parse_retrain_job_message(valid_retrain_message)
