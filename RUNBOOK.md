@@ -17,6 +17,7 @@ The system currently consists of:
 * Triage Agent
 * Async Tool Worker
 * Dashboard
+* MLflow (tracking server and model registry)
 * PostgreSQL
 * Redis
 * One-shot migration service
@@ -91,6 +92,7 @@ The default host mappings are:
 | Model Service |    `8020` |         `8000` |
 | Triage Agent  |    `8001` |         `8001` |
 | Dashboard     |    `8520` |         `8501` |
+| MLflow        |    `5000` |         `5000` |
 | PostgreSQL    |    `5432` |         `5432` |
 | Redis         |    `6379` |         `6379` |
 
@@ -134,7 +136,7 @@ DRIFT_WEBHOOK_SECRET=replace-with-a-long-random-development-secret
 Generate a local development secret with Python:
 
 ```bash
-python -c "import secrets; print(secrets.token_hex(32))"
+python3 -c "import secrets; print(secrets.token_hex(32))"
 ```
 
 Do not commit `.env`.
@@ -145,7 +147,16 @@ Verify that Git ignores it:
 git check-ignore -v .env
 ```
 
-### 3. Build and start the complete stack
+### 3. Train and register a model
+
+Model Service loads a real model from MLflow at startup and will not start successfully if the registry is empty — this must happen before step 4, not after. See [Training and Model Registry](#training-and-model-registry) below for the full flow; the short version:
+
+```bash
+docker compose up -d mlflow
+uv run --with-requirements training/requirements.txt python3 -m training.train
+```
+
+### 4. Build and start the complete stack
 
 ```bash
 docker compose up --build
@@ -170,14 +181,18 @@ Agent validates configuration and initializes dependencies
     ↓
 Agent becomes healthy
     ↓
-Model Service starts
+MLflow becomes healthy (already running from step 3)
+    ↓
+Model Service resolves and loads the registered model, then starts
     ↓
 Worker starts consuming the Redis Stream
     ↓
 Dashboard starts
 ```
 
-### 4. Confirm service state
+If step 3 was skipped, Model Service will restart-loop with `RuntimeError: No registered MLflow model versions found` in its logs — see [Model Service Fails to Start — Registry Empty or Invalid](#model-service-fails-to-start--registry-empty-or-invalid) in Troubleshooting.
+
+### 5. Confirm service state
 
 ```bash
 docker compose ps -a
@@ -191,6 +206,7 @@ Expected state:
 | `redis`         | Running and healthy  |
 | `migrate`       | Exited with code `0` |
 | `agent`         | Running and healthy  |
+| `mlflow`        | Running and healthy  |
 | `worker`        | Running              |
 | `model_service` | Running              |
 | `dashboard`     | Running              |
@@ -230,6 +246,16 @@ The Agent is considered ready only after:
 * LangGraph checkpoint storage is initialized;
 * the investigation graph has been compiled.
 
+### MLflow health
+
+```bash
+curl --fail http://localhost:5000/health
+```
+
+Expected: HTTP `200` with an empty or `OK` body.
+
+Model Service depends on MLflow being healthy (`docker-compose.yml`'s `depends_on: mlflow: condition: service_healthy`) and will not even start its container process until MLflow's own health check passes.
+
 ### Model Service health
 
 ```bash
@@ -244,6 +270,8 @@ Expected shape:
   "timestamp": "..."
 }
 ```
+
+A `200` here means more than the process is up: Model Service's FastAPI `lifespan` resolves and loads a real model from the MLflow registry *before* it starts accepting any HTTP traffic at all. If the registry has no registered model, or the registered artifact fails structural validation, startup raises and the container exits — it will not report healthy in a broken state. See [Training and Model Registry](#training-and-model-registry) below for how to get a model registered, and the troubleshooting entry below if this keeps failing.
 
 ### Dashboard health
 
@@ -300,6 +328,84 @@ Inspect its logs:
 
 ```bash
 docker compose logs migrate
+```
+
+---
+
+## Training and Model Registry
+
+Model Service does not train models or hold one baked into its image — it loads a real registered artifact from MLflow at startup. That means a model has to actually be registered before Model Service can start successfully.
+
+Operational flow:
+
+```text
+training.train
+    ↓
+MLflow Tracking Server (this repo's own docker-compose service, port 5000)
+    ↓
+registered model version (with operating_threshold, dataset hash, git commit tags)
+    ↓
+Model Service startup (resolves latest or pinned MODEL_VERSION, loads, validates, serves)
+```
+
+### 1. Start MLflow and confirm it's healthy
+
+```bash
+docker compose up -d mlflow
+docker compose ps mlflow
+curl --fail http://localhost:5000/health
+```
+
+### 2. Train and register a model
+
+Run this from the host (not inside a container) — training reads `data/bank-additional-full.csv` and writes to MLflow over the published `localhost:5000` port:
+
+```bash
+uv run --with-requirements training/requirements.txt python3 -m training.train
+```
+
+This registers a new version of `bank-marketing-classifier`. Watch the log line `Registered model: name=... version=... run_id=...` for the version number.
+
+### 3. Start (or restart) Model Service
+
+```bash
+docker compose up -d model_service
+# or, if it's already running against a stale/missing model:
+docker compose restart model_service
+```
+
+### 4. Confirm it loaded the model you expect
+
+```bash
+docker compose logs --no-log-prefix model_service --tail 15
+```
+
+Look for:
+
+```text
+Resolved registered model: name=bank-marketing-classifier version=<N> run_id=<...>
+Validated registered pipeline structure: domain_transformer=shared.preprocessing.BankMarketingFeatureTransformer
+Loaded registered model successfully: name=bank-marketing-classifier version=<N> run_id=<...>
+Operating threshold: <...>
+Model Service ready: model=bank-marketing-classifier version=<N> threshold=<...>
+```
+
+If instead you see `RuntimeError: No registered MLflow model versions found`, no model has been registered against this MLflow instance yet — go back to step 2. This is expected after any `docker compose down -v`, since that wipes the `mlflow_data` volume along with everything else.
+
+### Optional: see the model make real predictions
+
+```bash
+uv run --with-requirements training/requirements.txt python3 -m training.predict_examples
+```
+
+Loads the registered model and scores a handful of real validation-split rows, printing predicted probability, threshold, predicted label, and ground truth side by side. Never touches the sealed test set.
+
+### Pinning a specific version
+
+By default `MODEL_VERSION` is unset, which resolves to `latest` (highest registered version number). To pin Model Service to a specific version instead:
+
+```bash
+MODEL_VERSION=2 docker compose up -d model_service
 ```
 
 ---
@@ -547,8 +653,8 @@ docker compose exec -T redis \
 Create or activate a Python 3.11 virtual environment, then install the compiled test dependencies:
 
 ```bash
-python -m pip install --upgrade pip
-python -m pip install -r requirements-test.txt
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements-test.txt
 ```
 
 Verify the tools:
@@ -1353,6 +1459,43 @@ docker compose up --build
 
 ---
 
+## Model Service Fails to Start — Registry Empty or Invalid
+
+### Symptoms
+
+```bash
+docker compose ps model_service
+```
+
+shows the container repeatedly restarting, or `docker compose logs model_service` shows `Application startup failed. Exiting.`
+
+### Causes
+
+* No model has been registered yet against this MLflow instance (very common right after `docker compose down -v`, which wipes the `mlflow_data` volume).
+* `MODEL_VERSION` is pinned to a version number that doesn't exist.
+* MLflow itself isn't healthy yet, or isn't reachable at `http://mlflow:5000` from inside the Docker network — check for `403 Invalid Host header` in the logs specifically, which means MLflow's `--allowed-hosts` configuration doesn't trust the `mlflow` hostname (see `mlflow/Dockerfile`; this exact issue was hit and fixed during development).
+* The registered artifact's pipeline doesn't have the expected structure (e.g. it was trained before the `shared/preprocessing.py` extraction and references the old `training.preprocess.*` module path, which Model Service's container can't import).
+
+### Diagnosis
+
+```bash
+docker compose logs --no-log-prefix model_service --tail 30
+docker compose ps mlflow
+curl --fail http://localhost:5000/health
+```
+
+Read the exception at the bottom of the traceback — `RuntimeError: No registered MLflow model versions found`, a `403`, and a `ModuleNotFoundError` all mean different things and point to different fixes above.
+
+### Resolution
+
+Follow [Training and Model Registry](#training-and-model-registry) above to register a fresh model, then:
+
+```bash
+docker compose restart model_service
+```
+
+---
+
 ## Model Service Returns `502 dispatch_failed`
 
 ### Symptoms
@@ -1780,7 +1923,7 @@ dashboard/__init__.py
 Install the test environment:
 
 ```bash
-python -m pip install -r requirements-test.txt
+python3 -m pip install -r requirements-test.txt
 ```
 
 ---
@@ -1873,7 +2016,7 @@ DRIFT_WEBHOOK_SECRET=ci-only-shared-secret \
 
 ## Known Limitations
 
-The walking skeleton intentionally excludes several production capabilities, including real drift computation, real model training, complete supervisor orchestration, retries, dead-letter processing, promotion workflows, advanced authentication, and production observability.
+The walking skeleton intentionally excludes several production capabilities, including real drift computation, complete supervisor orchestration, retries, dead-letter processing, promotion workflows, advanced authentication, and production observability. Real model training was originally on this list too but is no longer a limitation — see below.
 
 The authoritative list is maintained in:
 
@@ -1885,19 +2028,27 @@ See the **Explicitly Deferred** section there rather than duplicating the list i
 
 Operationally significant limitations include:
 
-* the drift payload is deterministic and hardcoded;
-* the Worker performs stub execution rather than model training;
+* the drift payload is deterministic and hardcoded — there is no PSI/χ² computation against live traffic;
+* a real training pipeline exists (`training/train.py`, `training/evaluate.py`) and Model Service loads its output from MLflow at startup, but the automated retrain job dispatched by the Agent is still a stub — the Worker does not invoke real training itself;
 * failed or abandoned Redis messages are not reclaimed automatically;
 * retry backoff and DLQ movement are not implemented;
 * the Dashboard is read-only and manually refreshed;
 * HMAC uses one shared secret with no key rotation;
 * checkpoint execution is suitable for MVP traffic but not yet load-tested;
 * service containers still run as root;
+* MLflow has no authentication — anyone reaching port `5000` can read or write the registry (see `SECURITY.md`);
 * production-grade metrics, tracing, and alerting are deferred.
 
 ---
 
 ## Quick Reference
+
+Start MLflow and register a model (needed before Model Service will start successfully):
+
+```bash
+docker compose up -d mlflow
+uv run --with-requirements training/requirements.txt python3 -m training.train
+```
 
 Start the stack:
 
@@ -1915,6 +2066,12 @@ Check state:
 
 ```bash
 docker compose ps -a
+```
+
+See the model make real predictions:
+
+```bash
+uv run --with-requirements training/requirements.txt python3 -m training.predict_examples
 ```
 
 Trigger drift:

@@ -16,7 +16,9 @@ The objective of the MVP is to validate **architecture, contracts, connectivity,
 
 ## Post-MVP: Training Vertical
 
-The walking skeleton above is complete. The exclusions listed for the Model Service below ("model training", "MLflow integration beyond basic service wiring") described that first phase only. The next phase implements the real training vertical: preprocessing, a stratified train/validation/test split, a controlled candidate comparison (`class_weight=None` vs `balanced`), threshold selection under the `recall >= 0.75` business constraint, and MLflow model registration — evaluated on training and validation data only, with the test split still untouched. Wiring the registered model into the Model Service's inference path remains a separate, later step.
+The walking skeleton above is complete. The exclusions listed for the Model Service below ("model training", "MLflow integration beyond basic service wiring") described that first phase only. The next phase — now also complete — implemented the real training vertical: preprocessing, a stratified train/validation/test split, a controlled candidate comparison (`class_weight=None` vs `balanced`), threshold selection under the `recall >= 0.75` business constraint, MLflow model registration with full provenance, a sealed one-time final test evaluation, and Model Service loading the registered artifact from MLflow at startup (see `ARCH.md`'s Architecture Status and status tags for exactly what that does and doesn't include, e.g. there is still no `/predict` endpoint).
+
+The multi-agent supervisor, the promotion workflow, and real PSI/χ² drift computation — all explicitly deferred below — remain deferred; nothing in the training vertical changed that.
 
 ---
 
