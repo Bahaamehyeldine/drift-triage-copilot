@@ -1,3 +1,5 @@
+# training/train.py
+
 from __future__ import annotations
 
 import logging
@@ -5,8 +7,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    f1_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 
@@ -43,9 +53,12 @@ POSITIVE_TARGET_VALUE: Final[str] = "yes"
 NEGATIVE_TARGET_VALUE: Final[str] = "no"
 
 RANDOM_STATE: Final[int] = 42
-TEST_SIZE: Final[float] = 0.20
-VALIDATION_SIZE: Final[float] = 0.20
+
 TRAIN_SIZE: Final[float] = 0.60
+VALIDATION_SIZE: Final[float] = 0.20
+TEST_SIZE: Final[float] = 0.20
+
+MINIMUM_VALIDATION_RECALL: Final[float] = 0.75
 
 EXPECTED_RAW_COLUMN_COUNT: Final[int] = 21
 EXPECTED_FEATURE_COUNT: Final[int] = 20
@@ -60,8 +73,8 @@ class DatasetSplits:
     """
     Raw train, validation, and test partitions.
 
-    The splits intentionally contain unprocessed features. The fitted sklearn
-    pipeline owns all learned preprocessing state.
+    No learned preprocessing is performed before splitting. This prevents
+    validation/test statistics from leaking into the training pipeline.
     """
 
     X_train: pd.DataFrame
@@ -71,6 +84,22 @@ class DatasetSplits:
     y_train: pd.Series
     y_validation: pd.Series
     y_test: pd.Series
+
+
+@dataclass(frozen=True)
+class ValidationMetrics:
+    """
+    Validation metrics for the selected operating threshold.
+
+    The threshold is selected exclusively from validation data and must satisfy
+    the minimum-recall operating constraint.
+    """
+
+    threshold: float
+    roc_auc: float
+    precision: float
+    recall: float
+    f1: float
 
 
 # -----------------------------------------------------------------------------
@@ -85,13 +114,14 @@ def load_dataset(
 
     Returns:
         X:
-            Raw feature DataFrame containing all 20 source features. Leakage
-            removal and domain feature engineering happen inside the sklearn
-            preprocessing pipeline.
+            Raw model features. Domain-specific transformations such as
+            dropping duration and transforming pdays remain inside the
+            sklearn preprocessing pipeline.
 
         y:
-            Binary integer target where 1 represents subscription and 0
-            represents no subscription.
+            Binary target where:
+                no  -> 0
+                yes -> 1
     """
     if not dataset_path.is_file():
         raise FileNotFoundError(
@@ -115,7 +145,7 @@ def load_dataset(
             f"Target column {TARGET_COLUMN!r} is missing"
         )
 
-    target_values = set(
+    observed_target_values = set(
         dataframe[TARGET_COLUMN]
         .dropna()
         .unique()
@@ -127,11 +157,11 @@ def load_dataset(
         POSITIVE_TARGET_VALUE,
     }
 
-    if target_values != expected_target_values:
+    if observed_target_values != expected_target_values:
         raise ValueError(
             "Unexpected target values: "
             f"expected {sorted(expected_target_values)}, "
-            f"found {sorted(target_values)}"
+            f"found {sorted(observed_target_values)}"
         )
 
     X = dataframe.drop(
@@ -180,27 +210,45 @@ def create_stratified_splits(
     y: pd.Series,
 ) -> DatasetSplits:
     """
-    Split raw data into stratified 60/20/20 partitions.
+    Split the raw dataset into stratified 60/20/20 partitions.
 
-    The first split reserves 40% for validation and testing. The second split
-    divides that temporary partition equally, producing:
+    Split order:
 
-        training   = 60%
-        validation = 20%
-        test       = 20%
+        raw dataset
+            ↓
+        60% train + 40% temporary holdout
+            ↓
+        holdout split equally
+            ↓
+        20% validation + 20% test
 
-    No preprocessing is fitted before these splits are created.
+    Preprocessing is intentionally not fitted before this operation.
     """
-    holdout_size = VALIDATION_SIZE + TEST_SIZE
+    split_fraction_sum = (
+        TRAIN_SIZE
+        + VALIDATION_SIZE
+        + TEST_SIZE
+    )
 
-    if not abs(
-        TRAIN_SIZE + VALIDATION_SIZE + TEST_SIZE - 1.0
-    ) < 1e-12:
+    if not np.isclose(
+        split_fraction_sum,
+        1.0,
+    ):
         raise RuntimeError(
             "Train, validation, and test fractions must sum to 1.0"
         )
 
-    X_train, X_holdout, y_train, y_holdout = train_test_split(
+    holdout_size = (
+        VALIDATION_SIZE
+        + TEST_SIZE
+    )
+
+    (
+        X_train,
+        X_holdout,
+        y_train,
+        y_holdout,
+    ) = train_test_split(
         X,
         y,
         test_size=holdout_size,
@@ -208,7 +256,10 @@ def create_stratified_splits(
         stratify=y,
     )
 
-    relative_test_size = TEST_SIZE / holdout_size
+    relative_test_size = (
+        TEST_SIZE
+        / holdout_size
+    )
 
     (
         X_validation,
@@ -246,7 +297,13 @@ def validate_splits(
     total_row_count: int,
 ) -> None:
     """
-    Validate partition sizes, index isolation, and target alignment.
+    Validate partition integrity.
+
+    Checks:
+        - feature and target lengths match;
+        - indexes remain aligned;
+        - train/validation/test partitions do not overlap;
+        - all original rows are accounted for exactly once.
     """
     split_pairs = {
         "train": (
@@ -274,21 +331,27 @@ def validate_splits(
                 f"{split_name} feature and target indexes are misaligned"
             )
 
-    train_indexes = set(splits.X_train.index)
-    validation_indexes = set(splits.X_validation.index)
-    test_indexes = set(splits.X_test.index)
+    train_indexes = set(
+        splits.X_train.index
+    )
+    validation_indexes = set(
+        splits.X_validation.index
+    )
+    test_indexes = set(
+        splits.X_test.index
+    )
 
-    if train_indexes.intersection(validation_indexes):
+    if train_indexes & validation_indexes:
         raise RuntimeError(
             "Training and validation partitions overlap"
         )
 
-    if train_indexes.intersection(test_indexes):
+    if train_indexes & test_indexes:
         raise RuntimeError(
             "Training and test partitions overlap"
         )
 
-    if validation_indexes.intersection(test_indexes):
+    if validation_indexes & test_indexes:
         raise RuntimeError(
             "Validation and test partitions overlap"
         )
@@ -311,14 +374,16 @@ def validate_splits(
 
 def build_model_pipeline() -> Pipeline:
     """
-    Build the logistic-regression baseline.
+    Build the baseline model pipeline.
 
-    All learned preprocessing and classifier state is contained within one
-    sklearn Pipeline. Calling fit on this object with only the training split
-    prevents validation/test leakage.
+    Preprocessing and classification are kept in one sklearn Pipeline so all
+    learned preprocessing state is fitted exclusively from the training split.
+
+    l1_ratio=0.0 represents pure L2 regularization.
     """
     classifier = LogisticRegression(
-        penalty="l2",
+        C=1.0,
+        l1_ratio=0.0,
         solver="liblinear",
         max_iter=2_000,
         random_state=RANDOM_STATE,
@@ -339,12 +404,223 @@ def build_model_pipeline() -> Pipeline:
 
 
 # -----------------------------------------------------------------------------
-# Reporting
+# Validation threshold selection
+# -----------------------------------------------------------------------------
+
+def get_positive_class_index(
+    model_pipeline: Pipeline,
+) -> int:
+    """
+    Resolve the predict_proba column corresponding to positive class 1.
+
+    Avoids assuming class 1 is always the second probability column.
+    """
+    classifier = model_pipeline.named_steps[
+        "classifier"
+    ]
+
+    matching_indices = np.flatnonzero(
+        classifier.classes_ == 1
+    )
+
+    if len(matching_indices) != 1:
+        raise RuntimeError(
+            "Expected exactly one positive class labeled 1; "
+            f"found classes={classifier.classes_.tolist()}"
+        )
+
+    return int(
+        matching_indices[0]
+    )
+
+
+def evaluate_validation_threshold(
+    *,
+    model_pipeline: Pipeline,
+    X_validation: pd.DataFrame,
+    y_validation: pd.Series,
+    minimum_recall: float,
+) -> ValidationMetrics:
+    """
+    Select and evaluate the operating threshold on validation data only.
+
+    Selection rule:
+
+        maximize threshold
+        subject to recall >= minimum_recall
+
+    The test split must never be passed to this function.
+
+    The selected threshold is applied directly to validation probabilities and
+    recall is independently recomputed from the resulting binary predictions.
+    This verifies the actual decision rule that will later be used in serving.
+    """
+    if not 0.0 <= minimum_recall <= 1.0:
+        raise ValueError(
+            "minimum_recall must be between 0.0 and 1.0"
+        )
+
+    if len(X_validation) != len(y_validation):
+        raise ValueError(
+            "Validation features and target lengths differ"
+        )
+
+    if len(y_validation) == 0:
+        raise ValueError(
+            "Validation split cannot be empty"
+        )
+
+    positive_class_index = get_positive_class_index(
+        model_pipeline
+    )
+
+    validation_probabilities = (
+        model_pipeline.predict_proba(
+            X_validation
+        )[:, positive_class_index]
+    )
+
+    if not np.isfinite(
+        validation_probabilities
+    ).all():
+        raise RuntimeError(
+            "Validation probabilities contain non-finite values"
+        )
+
+    if (
+        (validation_probabilities < 0.0).any()
+        or (validation_probabilities > 1.0).any()
+    ):
+        raise RuntimeError(
+            "Validation probabilities must be between 0 and 1"
+        )
+
+    (
+        curve_precision,
+        curve_recall,
+        thresholds,
+    ) = precision_recall_curve(
+        y_validation,
+        validation_probabilities,
+    )
+
+    if thresholds.size == 0:
+        raise RuntimeError(
+            "precision_recall_curve produced no candidate thresholds"
+        )
+
+    # sklearn returns one additional precision/recall pair that has no matching
+    # threshold. Restrict both arrays to the threshold-aligned points.
+    threshold_precision = curve_precision[:-1]
+    threshold_recall = curve_recall[:-1]
+
+    if not (
+        len(thresholds)
+        == len(threshold_precision)
+        == len(threshold_recall)
+    ):
+        raise RuntimeError(
+            "Precision-recall curve arrays are unexpectedly misaligned"
+        )
+
+    eligible_indices = np.flatnonzero(
+        threshold_recall
+        >= minimum_recall
+    )
+
+    if len(eligible_indices) == 0:
+        raise RuntimeError(
+            "No validation threshold satisfies "
+            f"recall >= {minimum_recall:.2f}"
+        )
+
+    # sklearn returns thresholds in increasing order. The last eligible index
+    # is therefore the highest threshold that still satisfies the recall
+    # constraint.
+    selected_index = int(
+        eligible_indices[-1]
+    )
+
+    selected_threshold = float(
+        thresholds[selected_index]
+    )
+
+    validation_predictions = (
+        validation_probabilities
+        >= selected_threshold
+    ).astype("int8")
+
+    validation_auc = float(
+        roc_auc_score(
+            y_validation,
+            validation_probabilities,
+        )
+    )
+
+    validation_precision = float(
+        precision_score(
+            y_validation,
+            validation_predictions,
+            zero_division=0,
+        )
+    )
+
+    validation_recall = float(
+        recall_score(
+            y_validation,
+            validation_predictions,
+            zero_division=0,
+        )
+    )
+
+    validation_f1 = float(
+        f1_score(
+            y_validation,
+            validation_predictions,
+            zero_division=0,
+        )
+    )
+
+    # Verify the actual deployed decision rule rather than trusting only the
+    # precision-recall curve's threshold lookup.
+    if validation_recall + 1e-12 < minimum_recall:
+        raise RuntimeError(
+            "Selected threshold violated the recall constraint: "
+            f"recall={validation_recall:.6f}, "
+            f"required={minimum_recall:.6f}"
+        )
+
+    logger.debug(
+        "Selected PR-curve point: "
+        "threshold=%.6f curve_precision=%.6f curve_recall=%.6f",
+        selected_threshold,
+        float(
+            threshold_precision[selected_index]
+        ),
+        float(
+            threshold_recall[selected_index]
+        ),
+    )
+
+    return ValidationMetrics(
+        threshold=selected_threshold,
+        roc_auc=validation_auc,
+        precision=validation_precision,
+        recall=validation_recall,
+        f1=validation_f1,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Reporting and fit verification
 # -----------------------------------------------------------------------------
 
 def log_split_summary(
     splits: DatasetSplits,
 ) -> None:
+    """
+    Log split sizes and positive-class rates.
+    """
     split_data = {
         "train": (
             splits.X_train,
@@ -380,23 +656,31 @@ def log_fitted_pipeline_summary(
     splits: DatasetSplits,
 ) -> None:
     """
-    Confirm that the fitted training-only preprocessor can transform all
-    partitions using the same learned state.
+    Verify consistent feature transformation across partitions.
+
+    Validation and test partitions are transformed only with preprocessing
+    state already learned from the training split.
     """
     fitted_preprocessor = model_pipeline.named_steps[
         "preprocessor"
     ]
 
-    transformed_train = fitted_preprocessor.transform(
-        splits.X_train
+    transformed_train = (
+        fitted_preprocessor.transform(
+            splits.X_train
+        )
     )
 
-    transformed_validation = fitted_preprocessor.transform(
-        splits.X_validation
+    transformed_validation = (
+        fitted_preprocessor.transform(
+            splits.X_validation
+        )
     )
 
-    transformed_test = fitted_preprocessor.transform(
-        splits.X_test
+    transformed_test = (
+        fitted_preprocessor.transform(
+            splits.X_test
+        )
     )
 
     logger.info(
@@ -443,12 +727,57 @@ def log_fitted_pipeline_summary(
     )
 
 
+def log_validation_metrics(
+    metrics: ValidationMetrics,
+) -> None:
+    """
+    Log the selected validation operating point.
+    """
+    logger.info(
+        "Selected operating threshold: %.6f",
+        metrics.threshold,
+    )
+
+    logger.info(
+        "Validation ROC AUC: %.6f",
+        metrics.roc_auc,
+    )
+
+    logger.info(
+        "Validation precision: %.6f",
+        metrics.precision,
+    )
+
+    logger.info(
+        "Validation recall: %.6f",
+        metrics.recall,
+    )
+
+    logger.info(
+        "Validation F1: %.6f",
+        metrics.f1,
+    )
+
+    logger.info(
+        "Operating rule satisfied: validation recall >= %.2f",
+        MINIMUM_VALIDATION_RECALL,
+    )
+
+
 # -----------------------------------------------------------------------------
 # Entrypoint
 # -----------------------------------------------------------------------------
 
 def main() -> None:
+    # ------------------------------------------------------------------
+    # Load raw data
+    # ------------------------------------------------------------------
+
     X, y = load_dataset()
+
+    # ------------------------------------------------------------------
+    # Split before fitting any learned preprocessing
+    # ------------------------------------------------------------------
 
     splits = create_stratified_splits(
         X,
@@ -458,6 +787,10 @@ def main() -> None:
     log_split_summary(
         splits
     )
+
+    # ------------------------------------------------------------------
+    # Build and fit baseline
+    # ------------------------------------------------------------------
 
     model_pipeline = build_model_pipeline()
 
@@ -476,12 +809,40 @@ def main() -> None:
         splits,
     )
 
+    # ------------------------------------------------------------------
+    # Validation-only operating-threshold selection
+    # ------------------------------------------------------------------
+
     logger.info(
-        "Baseline training fit completed successfully. "
-        "Validation and test partitions have not been used for fitting."
+        "Evaluating candidate model on validation split only"
+    )
+
+    validation_metrics = (
+        evaluate_validation_threshold(
+            model_pipeline=model_pipeline,
+            X_validation=splits.X_validation,
+            y_validation=splits.y_validation,
+            minimum_recall=MINIMUM_VALIDATION_RECALL,
+        )
+    )
+
+    log_validation_metrics(
+        validation_metrics
+    )
+
+    # ------------------------------------------------------------------
+    # Explicit test-set guardrail
+    # ------------------------------------------------------------------
+
+    logger.info(
+        "Validation selection completed successfully"
+    )
+
+    logger.info(
+        "Test split remains untouched: no test predictions or "
+        "test metrics have been computed"
     )
 
 
 if __name__ == "__main__":
     main()
-
