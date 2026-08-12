@@ -46,6 +46,33 @@ services:
 
     restart: unless-stopped
 
+  mlflow:
+    build:
+      context: .
+      dockerfile: mlflow/Dockerfile
+
+    ports:
+      - "5000:5000"
+
+    volumes:
+      - mlflow_data:/mlflow/data
+      - mlflow_artifacts:/mlflow/artifacts
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=2)",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+    restart: unless-stopped
+
   migrate:
     build:
       context: .
@@ -178,3 +205,5 @@ services:
     restart: unless-stopped
 volumes:
   postgres_data:
+  mlflow_data:
+  mlflow_artifacts:
