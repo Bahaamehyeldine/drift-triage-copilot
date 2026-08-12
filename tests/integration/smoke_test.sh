@@ -122,7 +122,7 @@ wait_for_service_healthy() {
     log "Waiting for ${service} to become healthy"
 
     while true; do
-        health="$(docker compose ps --format json "${service}" | python -c '
+        health="$(docker compose ps --format json "${service}" | python3 -c '
 import json, sys
 raw = sys.stdin.read().strip()
 if not raw:
@@ -305,7 +305,7 @@ migration_status="$(
         --all \
         --format json \
         migrate \
-        | python -c '
+        | python3 -c '
 import json
 import sys
 
@@ -337,6 +337,28 @@ assert_equals \
     "0" \
     "${migration_status}" \
     "migration service exit code"
+
+
+# -----------------------------------------------------------------------------
+# Stage 2.5: MLflow and model registration
+# -----------------------------------------------------------------------------
+
+log "Starting MLflow"
+
+docker compose up \
+    --detach \
+    --build \
+    mlflow
+
+wait_for_service_healthy mlflow
+
+log "Training and registering a deterministic model for this smoke-test run"
+
+uv run \
+    --with-requirements training/requirements.txt \
+    python3 -m training.train
+
+log "Model registered successfully"
 
 
 # -----------------------------------------------------------------------------

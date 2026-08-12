@@ -37,6 +37,9 @@ jobs:
             requirements-test.txt
             migrations/requirements.txt
 
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+
       - name: Install test and service dependencies
         run: |
           set -euo pipefail

@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY model_service ./model_service
+COPY shared ./shared
 
 EXPOSE 8000
 

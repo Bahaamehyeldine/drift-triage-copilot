@@ -147,6 +147,7 @@ services:
       RETRAIN_JOB_STREAM: async-tools:retrain
       RETRAIN_CONSUMER_GROUP: retrain-workers
       RETRAIN_CONSUMER_NAME: worker-1
+
       REDIS_BLOCK_MS: "5000"
       STUB_EXECUTION_SECONDS: "1"
 
@@ -169,8 +170,14 @@ services:
 
     environment:
       DRIFT_WEBHOOK_SECRET: ${DRIFT_WEBHOOK_SECRET:?Please set DRIFT_WEBHOOK_SECRET in .env}
+
       AGENT_WEBHOOK_URL: http://agent:8001/webhooks/drift
       AGENT_REQUEST_TIMEOUT_SECONDS: "5"
+
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_REGISTERED_MODEL_NAME: bank-marketing-classifier
+
+      MODEL_VERSION: ${MODEL_VERSION:-latest}
 
     ports:
       - "8020:8000"
@@ -180,6 +187,9 @@ services:
         condition: service_completed_successfully
 
       agent:
+        condition: service_healthy
+
+      mlflow:
         condition: service_healthy
 
     restart: unless-stopped
@@ -199,10 +209,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
       migrate:
         condition: service_completed_successfully
 
     restart: unless-stopped
+
+
 volumes:
   postgres_data:
   mlflow_data:
