@@ -17,6 +17,7 @@ AGENT_HEALTH_URL="http://localhost:8001/health"
 AGENT_WEBHOOK_URL="http://localhost:8001/webhooks/drift"
 MODEL_SERVICE_HEALTH_URL="http://localhost:8020/health"
 MODEL_SERVICE_DRIFT_URL="http://localhost:8020/debug/drift"
+MODEL_SERVICE_PREDICT_URL="http://localhost:8020/predict"
 DASHBOARD_HEALTH_URL="http://localhost:8520/_stcore/health"
 
 REPORT_ID="drift-report-customer-churn-model-v12-2026-07-22T12:00:00Z"
@@ -227,6 +228,119 @@ trigger_drift_event() {
 }
 
 
+trigger_prediction_request() {
+    local response_file=$1
+    local status_code
+    local payload
+
+    payload="$(
+        cat <<'JSON'
+{"age":35,"job":"technician","marital":"married","education":"university.degree","default":"no","housing":"yes","loan":"no","contact":"cellular","month":"may","day_of_week":"mon","duration":250,"campaign":2,"pdays":999,"previous":0,"poutcome":"nonexistent","emp.var.rate":1.1,"cons.price.idx":93.994,"cons.conf.idx":-36.4,"euribor3m":4.857,"nr.employed":5191.0}
+JSON
+    )"
+
+    status_code="$(
+        curl \
+            --silent \
+            --show-error \
+            --output "${response_file}" \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --data "${payload}" \
+            "${MODEL_SERVICE_PREDICT_URL}"
+    )"
+
+    if [[ "${status_code}" != "200" ]]; then
+        cat "${response_file}" >&2 || true
+        fail "Prediction request returned HTTP ${status_code}; expected 200"
+    fi
+
+    log "Prediction request returned HTTP 200"
+}
+
+
+assert_prediction_response_is_well_formed() {
+    local response_file=$1
+    local summary
+
+    summary="$(
+        cat "${response_file}" | python3 -c '
+import json
+import sys
+
+body = json.load(sys.stdin)
+
+required_keys = {
+    "model_name",
+    "model_version",
+    "probability",
+    "threshold",
+    "prediction",
+    "prediction_label",
+}
+
+missing_keys = required_keys - set(body.keys())
+
+if missing_keys:
+    raise SystemExit(f"Prediction response is missing keys: {sorted(missing_keys)}")
+
+probability = body["probability"]
+threshold = body["threshold"]
+prediction = body["prediction"]
+prediction_label = body["prediction_label"]
+
+if not (0.0 <= probability <= 1.0):
+    raise SystemExit(f"probability out of [0, 1]: {probability}")
+
+if not (0.0 <= threshold <= 1.0):
+    raise SystemExit(f"threshold out of [0, 1]: {threshold}")
+
+if prediction not in (0, 1):
+    raise SystemExit(f"prediction is not 0 or 1: {prediction}")
+
+if prediction_label not in ("yes", "no"):
+    raise SystemExit(f"prediction_label is not yes/no: {prediction_label}")
+
+# Re-derive the decision independently rather than trusting the service
+# applied its own threshold correctly.
+expected_prediction = 1 if probability >= threshold else 0
+
+if prediction != expected_prediction:
+    raise SystemExit(
+        f"prediction ({prediction}) is inconsistent with probability "
+        f"({probability}) and threshold ({threshold})"
+    )
+
+expected_label = "yes" if expected_prediction == 1 else "no"
+
+if prediction_label != expected_label:
+    raise SystemExit(
+        f"prediction_label ({prediction_label!r}) does not match "
+        f"prediction ({prediction})"
+    )
+
+model_name = body["model_name"]
+model_version = body["model_version"]
+
+if not model_name:
+    raise SystemExit("model_name is empty")
+
+if not model_version:
+    raise SystemExit("model_version is empty")
+
+print(
+    f"model={model_name} version={model_version} "
+    f"probability={probability:.6f} threshold={threshold:.6f} "
+    f"prediction_label={prediction_label}"
+)
+'
+    )"
+
+    log "Prediction response verified: ${summary}"
+}
+
+
 assert_invalid_signature_rejected() {
     local response_file="${ARTIFACT_DIR}/invalid-signature-response.json"
     local invalid_payload
@@ -386,6 +500,23 @@ wait_for_http \
 wait_for_http \
     "Dashboard" \
     "${DASHBOARD_HEALTH_URL}"
+
+
+# -----------------------------------------------------------------------------
+# Stage 3.5: Model Service inference
+#
+# Proves the registered model Model Service loaded at startup can actually
+# serve a prediction, not just that the process is up. This is the same
+# path the Streamlit prediction form uses.
+# -----------------------------------------------------------------------------
+
+log "Requesting a prediction from the registered model"
+
+trigger_prediction_request \
+    "${ARTIFACT_DIR}/predict-response.json"
+
+assert_prediction_response_is_well_formed \
+    "${ARTIFACT_DIR}/predict-response.json"
 
 
 # -----------------------------------------------------------------------------

@@ -108,3 +108,25 @@ The checkpoint store preserves the Agent's progress and prior context, but regis
 
 **Reasoning:**
 Trying to maintain strict synchronization would add complexity without eliminating stale-state risks. The safer pattern is to treat checkpointed registry information as a snapshot, defer to the live registry, and stop or invalidate the workflow when the two no longer match. This is the same principle applied concretely in Decision 2 (promotion staleness check) and Decision 4 (checkpoint resume check) — those are two specific instances of this general rule, not separate mechanisms.
+
+---
+
+## 6. Prediction Request Schema and Inference Ownership (Dashboard → Model Service)
+
+**Status: Implemented** — `POST /predict` on Model Service, consumed by the Dashboard's "Try the Model" form and asserted on directly by the integration smoke test.
+
+**Decision:**
+`/predict` accepts the raw UCI Bank Marketing dataset schema exactly as the registered pipeline's domain transformer expects it — including `duration`, even though `duration` is dropped internally before the classifier ever sees it and never affects the prediction. Inference logic lives entirely inside Model Service: it is the only component that loads MLflow or the sklearn pipeline. The Dashboard is purely an HTTP client to `/predict`, the same relationship it already has to Postgres for investigations — it never imports MLflow or scikit-learn itself.
+
+**Context:**
+Once Model Service could load a registered model at startup, exposing a way to actually use it for a prediction was the natural next step. Two questions had to be answered deliberately rather than defaulted: what request schema to expose, and which component owns running the model.
+
+**Reasoning:**
+- *Raw schema over a slimmer serving-only schema:* inventing a smaller "serving schema" that omits fields the pipeline doesn't statistically need (like `duration`) would require either modifying the frozen, already-registered pipeline's expectations, or silently injecting a fabricated value server-side with no visibility into that happening. Preserving the exact schema the pipeline was actually trained and registered against is more honest about what the artifact requires, at the cost of one field in the contract being present but inert.
+- *`duration` accepted but ignored, not hidden:* it is a known leakage feature — real-world callers requesting a prediction before a call happens cannot know its duration. Silently dropping it from the API schema would hide *why* it's not needed; the field stays in the contract with an explicit description (visible in `/docs`) stating it is accepted for schema compatibility and never used.
+- *Categorical fields as literal enums, not free-form strings:* the trained `OneHotEncoder` uses `handle_unknown="ignore"`, so an invalid category would silently vanish into an all-zero encoding rather than erroring — validating against the exact category values observed in training data at the API boundary turns that silent failure mode into an immediate, clear `422`.
+- *Inference stays inside Model Service:* the same reasoning as the registry-loading work that came before it — the Dashboard reaching into MLflow or the pipeline directly would duplicate ownership of model lifecycle across two services and reopen exactly the kind of registry/consumer coupling problem `shared/preprocessing.py` and `shared/inference.py` exist to prevent.
+
+**Known limitations (deferred):**
+- No batch prediction endpoint — one row per request.
+- No input feature bounds beyond basic sanity ranges (e.g. `age`); out-of-distribution inputs are scored without a confidence/reliability signal.

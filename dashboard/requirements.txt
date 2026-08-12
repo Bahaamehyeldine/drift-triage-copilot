@@ -4,6 +4,7 @@ altair==6.2.2
     # via streamlit
 anyio==4.14.2
     # via
+    #   httpx
     #   starlette
     #   streamlit
 attrs==26.1.0
@@ -13,7 +14,10 @@ attrs==26.1.0
 blinker==1.9.0
     # via streamlit
 certifi==2026.7.22
-    # via requests
+    # via
+    #   httpcore
+    #   httpx
+    #   requests
 charset-normalizer==3.4.9
     # via requests
 click==8.4.2
@@ -27,12 +31,19 @@ gitpython==3.1.57
 greenlet==3.5.4
     # via sqlalchemy
 h11==0.16.0
-    # via uvicorn
+    # via
+    #   httpcore
+    #   uvicorn
+httpcore==1.0.9
+    # via httpx
 httptools==0.8.0
     # via streamlit
+httpx==0.28.1
+    # via -r dashboard/requirements.in
 idna==3.18
     # via
     #   anyio
+    #   httpx
     #   requests
 itsdangerous==2.2.0
     # via streamlit

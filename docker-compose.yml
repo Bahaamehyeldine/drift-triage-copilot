@@ -203,6 +203,8 @@ services:
       DATABASE_URL: >-
         postgresql+psycopg://postgres:postgres@postgres:5432/drift_triage
 
+      MODEL_SERVICE_URL: http://model_service:8000
+
     ports:
       - "8520:8501"
 
