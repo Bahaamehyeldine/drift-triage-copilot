@@ -1,6 +1,10 @@
 # Decisions Log
 
+Each decision below is tagged with its current implementation status. Unbuilt decisions are kept, not deleted — they're evidence of the architectural reasoning behind where the project is headed, not a claim that the code already does this.
+
 ## 1. Drift Webhook Contract (Model Service → Agent)
+
+**Status: Partially Implemented** — the webhook mechanics (HMAC signing, `report_id`-based dedup on the Agent side, the JSON schema shape) are real and exercised by the integration smoke test. The severity computation and conditional-firing logic described below are not: `/debug/drift` always emits the same deterministic signal unconditionally, there is no PSI/χ² computation against live traffic, and delivery is a single attempt with no exponential backoff — a failed delivery returns `502` to the caller rather than retrying automatically.
 
 **Decision:**
 The Model Service emits one webhook event per drift-check run to the Agent, fired only when the *overall* severity increases relative to the last severity the Agent was successfully notified about (not the last severity computed — see Reasoning). The event bundles every signal evaluated in that run rather than dispatching one call per feature. Numeric features are scored with PSI (severity bands: < 0.1 none, 0.1–0.25 medium, ≥ 0.25 high); categorical features are scored with a chi² test's p-value (bands: ≥ 0.05 none, 0.01–0.05 medium, < 0.01 high — note the direction is inverted relative to PSI, since a *smaller* p-value means a *larger* distributional difference). Delivery uses exponential backoff (3 attempts). The receiver deduplicates using `report_id`. The call is authenticated with a shared-secret header.
@@ -41,6 +45,8 @@ The platform needs to tell the Agent when something worth investigating has happ
 
 ## 2. Promotion Endpoint Contract (Agent → Model Service)
 
+**Status: Designed, not yet implemented** — no promotion endpoint exists in `model_service/main.py` today, and the Agent has no HMAC-signing/promotion-dispatch code. The decision below documents the intended contract for when this is built.
+
 **Decision:**
 After a human approves an action in the dashboard's HIL inbox, the Agent calls the Model Service's promotion endpoint with a payload identifying the exact model artifact (name, version, and artifact digest), the approval metadata, and the specific drift report (`based_on_report_id`) the recommendation was generated from. The request is authenticated with an HMAC-SHA256 signature over the request body (keyed by a versioned `key_id`), and is idempotent via `promotion_request_id`. Before executing, the Model Service compares `based_on_report_id` against the latest known report_id it has stored for that model — updated on *every* drift check, regardless of whether that check fired a webhook. A mismatch returns `409 Conflict` with both report IDs; a match proceeds to the existing promotion gate (day-4 checklist). Only the Agent holds the signing key — this endpoint cannot be called directly, bypassing the Agent, in v0.1.
 
@@ -62,6 +68,8 @@ This is the one HTTP call in the system that actually mutates Production. The br
 
 ## 3. Retrain Job — Idempotent Execution
 
+**Status: Implemented** — the `retrain_jobs` table and atomic claim-before-execute logic are real; the integration smoke test asserts `attempt_count = 1` after a duplicate delivery to prove it. The execution itself is a stub, not real training — the idempotency mechanism around it is what's real here.
+
 **Decision:**
 Every retrain job includes a unique `retrain_job_id`, reused across all retries. Before starting training, the worker atomically checks and claims this ID in Postgres.
 
@@ -75,6 +83,8 @@ The key must be checked and claimed **atomically** before training begins, not m
 
 ## 4. Checkpoint Resume — Stale Model URI Handling
 
+**Status: Designed, not yet implemented** — the current investigation graph is a single node (`START → initialize_investigation → END`) with no interrupt/resume path, so there is nothing yet that resumes from a checkpoint and needs to re-validate it. This decision documents the intended behavior once the graph grows an interruptible, resumable workflow.
+
 **Decision:**
 When resuming from a checkpoint, the Agent must first ask the Model Service or registry whether `investigating_model_uri` still exists and remains in the expected stage.
 
@@ -87,6 +97,8 @@ The Agent must not continue using stale checkpoint data. If the model is missing
 ---
 
 ## 5. Checkpoint Store vs. Model Registry — Source of Truth
+
+**Status: Principle established, not yet exercised** — this is the general rule behind Decisions 2 and 4, both of which are designed but not built. The registry itself (MLflow) is real and is genuinely the source of truth for model identity today; what's not yet built is the re-verification logic this principle calls for.
 
 **Decision:**
 Do not attempt to keep the checkpoint store and model registry perfectly synchronized. The model registry is the source of truth, and its live state must be re-verified before every consequential action.
