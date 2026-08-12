@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+import mlflow
 import numpy as np
 import pandas as pd
+from mlflow import MlflowClient
 from mlflow.models import infer_signature
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -20,9 +25,8 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 
-import mlflow
-from mlflow import MlflowClient
 from training.preprocess import build_preprocessor
+
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -39,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 # -----------------------------------------------------------------------------
-# Configuration
+# Dataset / model configuration
 # -----------------------------------------------------------------------------
 
 DATASET_PATH: Final[Path] = Path("data/bank-additional-full.csv")
@@ -63,17 +67,19 @@ EXPECTED_FEATURE_COUNT: Final[int] = 20
 MODEL_C: Final[float] = 1.0
 MODEL_MAX_ITERATIONS: Final[int] = 2_000
 
-# training/train.py runs on the host, not inside the docker-compose network,
-# so it must reach MLflow through the published port rather than the
-# ${MLFLOW_TRACKING_URI} service hostname used by in-network containers.
+SPLIT_STRATEGY_VERSION: Final[str] = "stratified_two_stage_v1"
+
+
+# -----------------------------------------------------------------------------
+# MLflow configuration
+# -----------------------------------------------------------------------------
+
 DEFAULT_MLFLOW_TRACKING_URI: Final[str] = "http://localhost:5000"
 DEFAULT_MLFLOW_EXPERIMENT_NAME: Final[str] = "bank-marketing"
-DEFAULT_MLFLOW_REGISTERED_MODEL_NAME: Final[str] = "bank-marketing-classifier"
+DEFAULT_MLFLOW_REGISTERED_MODEL_NAME: Final[str] = (
+    "bank-marketing-classifier"
+)
 
-# mlflow's default skops serialization refuses to deserialize types outside
-# a known-safe allowlist. build_preprocessor() returns a pipeline containing
-# our own BankMarketingFeatureTransformer, so it must be explicitly trusted;
-# numpy.dtype is pulled in as part of that transformer's fitted state.
 MLFLOW_TRUSTED_MODEL_TYPES: Final[tuple[str, ...]] = (
     "training.preprocess.BankMarketingFeatureTransformer",
     "numpy.dtype",
@@ -83,9 +89,36 @@ OPERATING_THRESHOLD_TAG: Final[str] = "operating_threshold"
 
 
 # -----------------------------------------------------------------------------
-# Data structures
+# Provenance keys
 # -----------------------------------------------------------------------------
 
+DATASET_SHA256_KEY: Final[str] = "dataset_sha256"
+SPLIT_SPEC_SHA256_KEY: Final[str] = "split_spec_sha256"
+SPLIT_MEMBERSHIP_SHA256_KEY: Final[str] = "split_membership_sha256"
+
+DATASET_PATH_KEY: Final[str] = "dataset_path"
+SPLIT_STRATEGY_KEY: Final[str] = "split_strategy"
+
+RANDOM_STATE_KEY: Final[str] = "random_state"
+TRAIN_SIZE_KEY: Final[str] = "train_size"
+VALIDATION_SIZE_KEY: Final[str] = "validation_size"
+TEST_SIZE_KEY: Final[str] = "test_size"
+
+GIT_COMMIT_SHA_KEY: Final[str] = "git_commit_sha"
+GIT_WORKTREE_DIRTY_KEY: Final[str] = "git_worktree_dirty"
+
+MODEL_VERSION_PROVENANCE_TAG_KEYS: Final[tuple[str, ...]] = (
+    DATASET_SHA256_KEY,
+    SPLIT_SPEC_SHA256_KEY,
+    SPLIT_MEMBERSHIP_SHA256_KEY,
+    GIT_COMMIT_SHA_KEY,
+    GIT_WORKTREE_DIRTY_KEY,
+)
+
+
+# -----------------------------------------------------------------------------
+# Data structures
+# -----------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class DatasetSplits:
@@ -120,7 +153,7 @@ class ValidationMetrics:
 @dataclass(frozen=True)
 class ModelCandidate:
     """
-    One explicitly defined logistic-regression experiment.
+    One explicitly controlled model candidate.
     """
 
     name: str
@@ -130,7 +163,7 @@ class ModelCandidate:
 @dataclass(frozen=True)
 class CandidateEvaluation:
     """
-    Validation result for one trained candidate.
+    Trained candidate plus validation evaluation.
     """
 
     candidate: ModelCandidate
@@ -141,7 +174,7 @@ class CandidateEvaluation:
 @dataclass(frozen=True)
 class ModelRegistration:
     """
-    Identifiers for one registered MLflow model version.
+    MLflow identifiers for the registered winning model.
     """
 
     run_id: str
@@ -166,9 +199,198 @@ MODEL_CANDIDATES: Final[tuple[ModelCandidate, ...]] = (
 
 
 # -----------------------------------------------------------------------------
-# Dataset loading
+# Generic hashing helpers
 # -----------------------------------------------------------------------------
 
+def sha256_bytes(payload: bytes) -> str:
+    """
+    Return the hexadecimal SHA-256 digest of raw bytes.
+    """
+    return hashlib.sha256(payload).hexdigest()
+
+
+def sha256_canonical_json(payload: object) -> str:
+    """
+    Hash a JSON-serializable value using deterministic serialization.
+    """
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+
+    return sha256_bytes(encoded)
+
+
+def compute_file_sha256(path: Path) -> str:
+    """
+    Compute SHA-256 over the exact bytes of a file.
+    """
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Cannot fingerprint missing file: {path}"
+        )
+
+    digest = hashlib.sha256()
+
+    with path.open("rb") as handle:
+        for chunk in iter(
+            lambda: handle.read(1024 * 1024),
+            b"",
+        ):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+# -----------------------------------------------------------------------------
+# Split provenance
+# -----------------------------------------------------------------------------
+
+def build_split_specification() -> dict[str, str | int | float]:
+    """
+    Return the canonical configuration defining the dataset split.
+
+    SPLIT_STRATEGY_VERSION must change deliberately if the split algorithm
+    itself changes in a way that can alter partition membership.
+    """
+    return {
+        "strategy": SPLIT_STRATEGY_VERSION,
+        "random_state": RANDOM_STATE,
+        "train_size": TRAIN_SIZE,
+        "validation_size": VALIDATION_SIZE,
+        "test_size": TEST_SIZE,
+        "stratified": "true",
+    }
+
+
+def compute_split_spec_sha256() -> str:
+    """
+    Fingerprint the split configuration independently of actual row membership.
+    """
+    return sha256_canonical_json(
+        build_split_specification()
+    )
+
+
+def _canonical_index_membership(
+    index: pd.Index,
+) -> list[int]:
+    """
+    Normalize row membership for deterministic hashing.
+
+    The committed UCI dataset loads with a RangeIndex, so integer source-row
+    indexes are the stable row identifiers for this training vertical.
+    """
+    normalized: list[int] = []
+
+    for value in index.tolist():
+        try:
+            normalized.append(
+                int(value)
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Split membership fingerprinting requires "
+                "integer-convertible source indexes"
+            ) from exc
+
+    return sorted(normalized)
+
+
+def compute_split_membership_sha256(
+    splits: DatasetSplits,
+) -> str:
+    """
+    Fingerprint the exact source-row membership of every partition.
+
+    This is stronger than storing only random_state and split percentages:
+    even if split implementation changes later, a membership mismatch will be
+    detected before final test evaluation.
+    """
+    membership = {
+        "train": _canonical_index_membership(
+            splits.X_train.index
+        ),
+        "validation": _canonical_index_membership(
+            splits.X_validation.index
+        ),
+        "test": _canonical_index_membership(
+            splits.X_test.index
+        ),
+    }
+
+    return sha256_canonical_json(
+        membership
+    )
+
+
+# -----------------------------------------------------------------------------
+# Git provenance
+# -----------------------------------------------------------------------------
+
+def resolve_git_commit_sha() -> str:
+    """
+    Resolve the repository commit that produced the training execution.
+
+    Returns "unknown" when Git metadata is unavailable, for example when the
+    code is executed from an exported source archive.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "rev-parse",
+                "HEAD",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+    ):
+        return "unknown"
+
+    commit_sha = result.stdout.strip()
+
+    return commit_sha or "unknown"
+
+
+def resolve_git_worktree_dirty() -> bool:
+    """
+    Record whether training ran with uncommitted repository changes.
+
+    This prevents a clean Git SHA from falsely implying that the running
+    source code exactly matched the referenced commit.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "status",
+                "--porcelain",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+    ):
+        return True
+
+    return bool(
+        result.stdout.strip()
+    )
+
+
+# -----------------------------------------------------------------------------
+# Dataset loading
+# -----------------------------------------------------------------------------
 
 def load_dataset(
     dataset_path: Path = DATASET_PATH,
@@ -177,7 +399,9 @@ def load_dataset(
     Load and validate the raw UCI Bank Marketing dataset.
     """
     if not dataset_path.is_file():
-        raise FileNotFoundError(f"Dataset was not found: {dataset_path}")
+        raise FileNotFoundError(
+            f"Dataset was not found: {dataset_path}"
+        )
 
     dataframe = pd.read_csv(
         dataset_path,
@@ -192,9 +416,16 @@ def load_dataset(
         )
 
     if TARGET_COLUMN not in dataframe.columns:
-        raise ValueError(f"Target column {TARGET_COLUMN!r} is missing")
+        raise ValueError(
+            f"Target column {TARGET_COLUMN!r} is missing"
+        )
 
-    observed_target_values = set(dataframe[TARGET_COLUMN].dropna().unique().tolist())
+    observed_target_values = set(
+        dataframe[TARGET_COLUMN]
+        .dropna()
+        .unique()
+        .tolist()
+    )
 
     expected_target_values = {
         NEGATIVE_TARGET_VALUE,
@@ -208,7 +439,9 @@ def load_dataset(
             f"found {sorted(observed_target_values)}"
         )
 
-    X = dataframe.drop(columns=[TARGET_COLUMN])
+    X = dataframe.drop(
+        columns=[TARGET_COLUMN]
+    )
 
     y = (
         dataframe[TARGET_COLUMN]
@@ -229,7 +462,9 @@ def load_dataset(
         )
 
     if y.isna().any():
-        raise ValueError("Target encoding produced missing values")
+        raise ValueError(
+            "Target encoding produced missing values"
+        )
 
     logger.info(
         "Loaded dataset: rows=%d raw_features=%d positive_rate=%.4f",
@@ -245,23 +480,31 @@ def load_dataset(
 # Stratified splitting
 # -----------------------------------------------------------------------------
 
-
 def create_stratified_splits(
     X: pd.DataFrame,
     y: pd.Series,
 ) -> DatasetSplits:
     """
-    Create deterministic stratified 60/20/20 train/validation/test splits.
+    Create deterministic stratified 60/20/20 partitions.
     """
-    total_fraction = TRAIN_SIZE + VALIDATION_SIZE + TEST_SIZE
+    total_fraction = (
+        TRAIN_SIZE
+        + VALIDATION_SIZE
+        + TEST_SIZE
+    )
 
     if not np.isclose(
         total_fraction,
         1.0,
     ):
-        raise RuntimeError("Train, validation, and test fractions must sum to 1.0")
+        raise RuntimeError(
+            "Train, validation, and test fractions must sum to 1.0"
+        )
 
-    holdout_size = VALIDATION_SIZE + TEST_SIZE
+    holdout_size = (
+        VALIDATION_SIZE
+        + TEST_SIZE
+    )
 
     (
         X_train,
@@ -276,7 +519,10 @@ def create_stratified_splits(
         stratify=y,
     )
 
-    relative_test_size = TEST_SIZE / holdout_size
+    relative_test_size = (
+        TEST_SIZE
+        / holdout_size
+    )
 
     (
         X_validation,
@@ -314,7 +560,7 @@ def validate_splits(
     total_row_count: int,
 ) -> None:
     """
-    Verify split integrity and prevent accidental overlap.
+    Verify split alignment, isolation, and completeness.
     """
     split_pairs = {
         "train": (
@@ -331,47 +577,68 @@ def validate_splits(
         ),
     }
 
-    for split_name, (features, target) in split_pairs.items():
+    for split_name, (
+        features,
+        target,
+    ) in split_pairs.items():
         if len(features) != len(target):
-            raise RuntimeError(f"{split_name} feature and target lengths differ")
+            raise RuntimeError(
+                f"{split_name} feature and target lengths differ"
+            )
 
-        if not features.index.equals(target.index):
+        if not features.index.equals(
+            target.index
+        ):
             raise RuntimeError(
                 f"{split_name} feature and target indexes are misaligned"
             )
 
-    train_indexes = set(splits.X_train.index)
-    validation_indexes = set(splits.X_validation.index)
-    test_indexes = set(splits.X_test.index)
+    train_indexes = set(
+        splits.X_train.index
+    )
+    validation_indexes = set(
+        splits.X_validation.index
+    )
+    test_indexes = set(
+        splits.X_test.index
+    )
 
     if train_indexes & validation_indexes:
-        raise RuntimeError("Training and validation partitions overlap")
+        raise RuntimeError(
+            "Training and validation partitions overlap"
+        )
 
     if train_indexes & test_indexes:
-        raise RuntimeError("Training and test partitions overlap")
+        raise RuntimeError(
+            "Training and test partitions overlap"
+        )
 
     if validation_indexes & test_indexes:
-        raise RuntimeError("Validation and test partitions overlap")
+        raise RuntimeError(
+            "Validation and test partitions overlap"
+        )
 
-    combined_indexes = train_indexes | validation_indexes | test_indexes
+    combined_indexes = (
+        train_indexes
+        | validation_indexes
+        | test_indexes
+    )
 
     if len(combined_indexes) != total_row_count:
-        raise RuntimeError("The dataset split lost or duplicated rows")
+        raise RuntimeError(
+            "The dataset split lost or duplicated rows"
+        )
 
 
 # -----------------------------------------------------------------------------
 # Model construction
 # -----------------------------------------------------------------------------
 
-
 def build_model_pipeline(
     candidate: ModelCandidate,
 ) -> Pipeline:
     """
-    Build one logistic-regression candidate.
-
-    Every candidate uses the same preprocessing and hyperparameters except
-    for the explicitly varied class_weight setting.
+    Build one controlled logistic-regression candidate.
     """
     classifier = LogisticRegression(
         C=MODEL_C,
@@ -400,16 +667,19 @@ def build_model_pipeline(
 # Probability handling
 # -----------------------------------------------------------------------------
 
-
 def get_positive_class_index(
     model_pipeline: Pipeline,
 ) -> int:
     """
-    Return the predict_proba column corresponding to positive class 1.
+    Resolve the predict_proba column corresponding to class 1.
     """
-    classifier = model_pipeline.named_steps["classifier"]
+    classifier = model_pipeline.named_steps[
+        "classifier"
+    ]
 
-    matching_indices = np.flatnonzero(classifier.classes_ == 1)
+    matching_indices = np.flatnonzero(
+        classifier.classes_ == 1
+    )
 
     if len(matching_indices) != 1:
         raise RuntimeError(
@@ -417,13 +687,14 @@ def get_positive_class_index(
             f"found classes={classifier.classes_.tolist()}"
         )
 
-    return int(matching_indices[0])
+    return int(
+        matching_indices[0]
+    )
 
 
 # -----------------------------------------------------------------------------
 # Validation threshold selection
 # -----------------------------------------------------------------------------
-
 
 def evaluate_validation_threshold(
     *,
@@ -433,33 +704,55 @@ def evaluate_validation_threshold(
     minimum_recall: float,
 ) -> ValidationMetrics:
     """
-    Select the highest threshold satisfying the validation recall constraint.
-
-    Selection rule:
-
-        maximize threshold
-        subject to recall >= minimum_recall
+    Select the highest validation threshold satisfying the recall constraint.
     """
     if not 0.0 <= minimum_recall <= 1.0:
-        raise ValueError("minimum_recall must be between 0.0 and 1.0")
+        raise ValueError(
+            "minimum_recall must be between 0.0 and 1.0"
+        )
 
-    if len(X_validation) != len(y_validation):
-        raise ValueError("Validation features and target lengths differ")
+    if len(X_validation) != len(
+        y_validation
+    ):
+        raise ValueError(
+            "Validation features and target lengths differ"
+        )
 
     if len(y_validation) == 0:
-        raise ValueError("Validation split cannot be empty")
+        raise ValueError(
+            "Validation split cannot be empty"
+        )
 
-    positive_class_index = get_positive_class_index(model_pipeline)
+    positive_class_index = get_positive_class_index(
+        model_pipeline
+    )
 
-    validation_probabilities = model_pipeline.predict_proba(X_validation)[
-        :, positive_class_index
-    ]
+    validation_probabilities = (
+        model_pipeline.predict_proba(
+            X_validation
+        )[:, positive_class_index]
+    )
 
-    if not np.isfinite(validation_probabilities).all():
-        raise RuntimeError("Validation probabilities contain non-finite values")
+    if not np.isfinite(
+        validation_probabilities
+    ).all():
+        raise RuntimeError(
+            "Validation probabilities contain non-finite values"
+        )
 
-    if (validation_probabilities < 0.0).any() or (validation_probabilities > 1.0).any():
-        raise RuntimeError("Validation probabilities must be between 0 and 1")
+    if (
+        (
+            validation_probabilities
+            < 0.0
+        ).any()
+        or (
+            validation_probabilities
+            > 1.0
+        ).any()
+    ):
+        raise RuntimeError(
+            "Validation probabilities must be between 0 and 1"
+        )
 
     (
         curve_precision,
@@ -471,28 +764,49 @@ def evaluate_validation_threshold(
     )
 
     if thresholds.size == 0:
-        raise RuntimeError("precision_recall_curve produced no candidate thresholds")
+        raise RuntimeError(
+            "precision_recall_curve produced no candidate thresholds"
+        )
 
-    threshold_precision = curve_precision[:-1]
-    threshold_recall = curve_recall[:-1]
+    threshold_precision = (
+        curve_precision[:-1]
+    )
+    threshold_recall = (
+        curve_recall[:-1]
+    )
 
-    if not (len(thresholds) == len(threshold_precision) == len(threshold_recall)):
-        raise RuntimeError("Precision-recall arrays are unexpectedly misaligned")
+    if not (
+        len(thresholds)
+        == len(threshold_precision)
+        == len(threshold_recall)
+    ):
+        raise RuntimeError(
+            "Precision-recall arrays are unexpectedly misaligned"
+        )
 
-    eligible_indices = np.flatnonzero(threshold_recall >= minimum_recall)
+    eligible_indices = np.flatnonzero(
+        threshold_recall
+        >= minimum_recall
+    )
 
     if len(eligible_indices) == 0:
         raise RuntimeError(
-            f"No validation threshold satisfies recall >= {minimum_recall:.2f}"
+            "No validation threshold satisfies "
+            f"recall >= {minimum_recall:.2f}"
         )
 
-    selected_index = int(eligible_indices[-1])
-
-    selected_threshold = float(thresholds[selected_index])
-
-    validation_predictions = (validation_probabilities >= selected_threshold).astype(
-        "int8"
+    selected_index = int(
+        eligible_indices[-1]
     )
+
+    selected_threshold = float(
+        thresholds[selected_index]
+    )
+
+    validation_predictions = (
+        validation_probabilities
+        >= selected_threshold
+    ).astype("int8")
 
     validation_auc = float(
         roc_auc_score(
@@ -525,7 +839,10 @@ def evaluate_validation_threshold(
         )
     )
 
-    if validation_recall + 1e-12 < minimum_recall:
+    if (
+        validation_recall + 1e-12
+        < minimum_recall
+    ):
         raise RuntimeError(
             "Selected threshold violated the recall constraint: "
             f"recall={validation_recall:.6f}, "
@@ -536,8 +853,16 @@ def evaluate_validation_threshold(
         "Selected threshold point: "
         "threshold=%.6f curve_precision=%.6f curve_recall=%.6f",
         selected_threshold,
-        float(threshold_precision[selected_index]),
-        float(threshold_recall[selected_index]),
+        float(
+            threshold_precision[
+                selected_index
+            ]
+        ),
+        float(
+            threshold_recall[
+                selected_index
+            ]
+        ),
     )
 
     return ValidationMetrics(
@@ -553,14 +878,13 @@ def evaluate_validation_threshold(
 # Candidate evaluation
 # -----------------------------------------------------------------------------
 
-
 def evaluate_candidate(
     *,
     candidate: ModelCandidate,
     splits: DatasetSplits,
 ) -> CandidateEvaluation:
     """
-    Train one candidate on training data and evaluate it on validation only.
+    Train on training data and evaluate on validation data only.
     """
     logger.info(
         "Training candidate: %s class_weight=%s",
@@ -568,7 +892,9 @@ def evaluate_candidate(
         candidate.class_weight,
     )
 
-    model_pipeline = build_model_pipeline(candidate)
+    model_pipeline = build_model_pipeline(
+        candidate
+    )
 
     model_pipeline.fit(
         splits.X_train,
@@ -608,24 +934,30 @@ def evaluate_candidate(
 
 
 def select_best_candidate(
-    evaluations: list[CandidateEvaluation],
+    evaluations: list[
+        CandidateEvaluation
+    ],
 ) -> CandidateEvaluation:
     """
     Select the final candidate using validation data only.
 
-    Selection policy:
-        1. all candidates must satisfy the recall constraint;
-        2. prefer higher F1 at the selected operating threshold;
-        3. use precision as the first tie-breaker;
-        4. use ROC AUC as the second tie-breaker.
-
-    The test set is not consulted.
+    Policy:
+        1. recall constraint must be satisfied;
+        2. maximize validation F1;
+        3. precision is first tie-breaker;
+        4. ROC AUC is second tie-breaker.
     """
     if not evaluations:
-        raise ValueError("No candidate evaluations were provided")
+        raise ValueError(
+            "No candidate evaluations were provided"
+        )
 
     for evaluation in evaluations:
-        if evaluation.metrics.recall + 1e-12 < MINIMUM_VALIDATION_RECALL:
+        if (
+            evaluation.metrics.recall
+            + 1e-12
+            < MINIMUM_VALIDATION_RECALL
+        ):
             raise RuntimeError(
                 "Candidate unexpectedly violates recall constraint: "
                 f"{evaluation.candidate.name}"
@@ -642,41 +974,125 @@ def select_best_candidate(
 
 
 # -----------------------------------------------------------------------------
+# Provenance construction
+# -----------------------------------------------------------------------------
+
+def build_training_provenance(
+    *,
+    splits: DatasetSplits,
+    dataset_path: Path = DATASET_PATH,
+) -> dict[str, str]:
+    """
+    Construct immutable provenance metadata for the model run.
+    """
+    dataset_sha256 = compute_file_sha256(
+        dataset_path
+    )
+
+    split_spec_sha256 = compute_split_spec_sha256()
+
+    split_membership_sha256 = (
+        compute_split_membership_sha256(
+            splits
+        )
+    )
+
+    git_commit_sha = resolve_git_commit_sha()
+    git_worktree_dirty = (
+        resolve_git_worktree_dirty()
+    )
+
+    provenance = {
+        DATASET_SHA256_KEY: dataset_sha256,
+        SPLIT_SPEC_SHA256_KEY: split_spec_sha256,
+        SPLIT_MEMBERSHIP_SHA256_KEY: (
+            split_membership_sha256
+        ),
+        DATASET_PATH_KEY: str(
+            dataset_path
+        ),
+        SPLIT_STRATEGY_KEY: (
+            SPLIT_STRATEGY_VERSION
+        ),
+        RANDOM_STATE_KEY: str(
+            RANDOM_STATE
+        ),
+        TRAIN_SIZE_KEY: repr(
+            TRAIN_SIZE
+        ),
+        VALIDATION_SIZE_KEY: repr(
+            VALIDATION_SIZE
+        ),
+        TEST_SIZE_KEY: repr(
+            TEST_SIZE
+        ),
+        GIT_COMMIT_SHA_KEY: git_commit_sha,
+        GIT_WORKTREE_DIRTY_KEY: (
+            str(git_worktree_dirty).lower()
+        ),
+    }
+
+    logger.info(
+        "Training provenance: dataset_sha256=%s "
+        "split_spec_sha256=%s "
+        "split_membership_sha256=%s "
+        "git_commit_sha=%s dirty=%s",
+        dataset_sha256,
+        split_spec_sha256,
+        split_membership_sha256,
+        git_commit_sha,
+        git_worktree_dirty,
+    )
+
+    return provenance
+
+
+# -----------------------------------------------------------------------------
 # MLflow registration
 # -----------------------------------------------------------------------------
 
-
-def configure_mlflow() -> tuple[str, str]:
+def configure_mlflow() -> tuple[
+    str,
+    str,
+]:
     """
-    Point the MLflow client at the tracking server and target experiment.
-
-    Returns the resolved experiment name and registered model name so the
-    caller logs exactly what configuration was used.
+    Configure tracking server, experiment, and registry target.
     """
     tracking_uri = os.environ.get(
         "MLFLOW_TRACKING_URI",
         DEFAULT_MLFLOW_TRACKING_URI,
     )
+
     experiment_name = os.environ.get(
         "MLFLOW_EXPERIMENT_NAME",
         DEFAULT_MLFLOW_EXPERIMENT_NAME,
     )
+
     registered_model_name = os.environ.get(
         "MLFLOW_REGISTERED_MODEL_NAME",
         DEFAULT_MLFLOW_REGISTERED_MODEL_NAME,
     )
 
-    mlflow.set_tracking_uri(tracking_uri)
-    mlflow.set_experiment(experiment_name)
+    mlflow.set_tracking_uri(
+        tracking_uri
+    )
+
+    mlflow.set_experiment(
+        experiment_name
+    )
 
     logger.info(
-        "Configured MLflow: tracking_uri=%s experiment=%s registered_model=%s",
+        "Configured MLflow: tracking_uri=%s "
+        "experiment=%s registered_model=%s",
         tracking_uri,
         experiment_name,
         registered_model_name,
     )
 
-    return experiment_name, registered_model_name
+    return (
+        experiment_name,
+        registered_model_name,
+    )
 
 
 def register_selected_model(
@@ -686,16 +1102,21 @@ def register_selected_model(
     registered_model_name: str,
 ) -> ModelRegistration:
     """
-    Log the selected candidate's run and register it as a new model version.
-
-    Records parameters, validation metrics, the operating threshold, and the
-    fitted preprocessing + classifier pipeline as a single MLflow model.
+    Persist the selected candidate and its full provenance in MLflow.
     """
-    classifier = selected.pipeline.named_steps["classifier"]
+    classifier = selected.pipeline.named_steps[
+        "classifier"
+    ]
+
+    provenance = build_training_provenance(
+        splits=splits
+    )
 
     signature = infer_signature(
         splits.X_validation,
-        selected.pipeline.predict(splits.X_validation),
+        selected.pipeline.predict(
+            splits.X_validation
+        ),
     )
 
     with mlflow.start_run(
@@ -703,50 +1124,84 @@ def register_selected_model(
     ) as run:
         mlflow.log_params(
             {
-                "candidate_name": selected.candidate.name,
+                "candidate_name": (
+                    selected.candidate.name
+                ),
                 "class_weight": (
                     selected.candidate.class_weight
-                    if selected.candidate.class_weight is not None
+                    if (
+                        selected.candidate.class_weight
+                        is not None
+                    )
                     else "None"
                 ),
                 "C": classifier.C,
-                "l1_ratio": classifier.l1_ratio,
+                "l1_ratio": (
+                    classifier.l1_ratio
+                ),
                 "solver": classifier.solver,
                 "max_iter": classifier.max_iter,
-                "random_state": classifier.random_state,
-                "minimum_validation_recall": MINIMUM_VALIDATION_RECALL,
+                "random_state": (
+                    classifier.random_state
+                ),
+                "minimum_validation_recall": (
+                    MINIMUM_VALIDATION_RECALL
+                ),
+                **provenance,
             }
         )
 
         mlflow.log_metrics(
             {
-                "validation_roc_auc": selected.metrics.roc_auc,
-                "validation_precision": selected.metrics.precision,
-                "validation_recall": selected.metrics.recall,
-                "validation_f1": selected.metrics.f1,
-                "operating_threshold": selected.metrics.threshold,
+                "validation_roc_auc": (
+                    selected.metrics.roc_auc
+                ),
+                "validation_precision": (
+                    selected.metrics.precision
+                ),
+                "validation_recall": (
+                    selected.metrics.recall
+                ),
+                "validation_f1": (
+                    selected.metrics.f1
+                ),
+                "operating_threshold": (
+                    selected.metrics.threshold
+                ),
             }
         )
 
         mlflow.set_tag(
             OPERATING_THRESHOLD_TAG,
-            f"{selected.metrics.threshold:.6f}",
+            f"{selected.metrics.threshold:.12f}",
         )
 
         model_info = mlflow.sklearn.log_model(
             sk_model=selected.pipeline,
             name="model",
             signature=signature,
-            registered_model_name=registered_model_name,
-            skops_trusted_types=list(MLFLOW_TRUSTED_MODEL_TYPES),
+            registered_model_name=(
+                registered_model_name
+            ),
+            skops_trusted_types=list(
+                MLFLOW_TRUSTED_MODEL_TYPES
+            ),
         )
 
         run_id = run.info.run_id
 
-    if model_info.registered_model_version is None:
-        raise RuntimeError("Model logging did not return a registered model version")
+    if (
+        model_info.registered_model_version
+        is None
+    ):
+        raise RuntimeError(
+            "Model logging did not return a "
+            "registered model version"
+        )
 
-    model_version = str(model_info.registered_model_version)
+    model_version = str(
+        model_info.registered_model_version
+    )
 
     client = MlflowClient()
 
@@ -754,8 +1209,18 @@ def register_selected_model(
         name=registered_model_name,
         version=model_version,
         key=OPERATING_THRESHOLD_TAG,
-        value=f"{selected.metrics.threshold:.6f}",
+        value=(
+            f"{selected.metrics.threshold:.12f}"
+        ),
     )
+
+    for key in MODEL_VERSION_PROVENANCE_TAG_KEYS:
+        client.set_model_version_tag(
+            name=registered_model_name,
+            version=model_version,
+            key=key,
+            value=provenance[key],
+        )
 
     logger.info(
         "Registered model: name=%s version=%s run_id=%s",
@@ -778,64 +1243,96 @@ def verify_registered_model(
     splits: DatasetSplits,
 ) -> None:
     """
-    Load the registered model version back from MLflow and confirm it
-    reproduces the predictions and probabilities of the pipeline that was
-    actually evaluated on validation data.
-
-    Registration is worthless if the artifact that comes back out cannot be
-    loaded or silently disagrees with the model that was selected.
+    Reload the registered model and prove serialization fidelity.
     """
     client = MlflowClient()
 
-    model_version_details = client.get_model_version(
-        name=registration.model_name,
-        version=registration.model_version,
+    model_version_details = (
+        client.get_model_version(
+            name=registration.model_name,
+            version=registration.model_version,
+        )
     )
 
-    if model_version_details.run_id != registration.run_id:
+    if (
+        model_version_details.run_id
+        != registration.run_id
+    ):
         raise RuntimeError(
-            "Registered model version is not linked to the expected run: "
-            f"expected run_id={registration.run_id}, "
-            f"found run_id={model_version_details.run_id}"
+            "Registered model version is not linked to "
+            "the expected run: "
+            f"expected={registration.run_id}, "
+            f"found={model_version_details.run_id}"
         )
 
-    model_uri = f"models:/{registration.model_name}/{registration.model_version}"
+    model_uri = (
+        f"models:/{registration.model_name}/"
+        f"{registration.model_version}"
+    )
 
-    loaded_pipeline = mlflow.sklearn.load_model(model_uri)
+    loaded_pipeline = (
+        mlflow.sklearn.load_model(
+            model_uri
+        )
+    )
 
-    expected_predictions = selected.pipeline.predict(splits.X_validation)
+    expected_predictions = (
+        selected.pipeline.predict(
+            splits.X_validation
+        )
+    )
 
-    loaded_predictions = loaded_pipeline.predict(splits.X_validation)
+    loaded_predictions = (
+        loaded_pipeline.predict(
+            splits.X_validation
+        )
+    )
 
     if not np.array_equal(
         expected_predictions,
         loaded_predictions,
     ):
-        raise RuntimeError("Loaded model predictions do not match the trained pipeline")
+        raise RuntimeError(
+            "Loaded model predictions do not match "
+            "the selected pipeline"
+        )
 
-    expected_positive_class_index = get_positive_class_index(selected.pipeline)
+    expected_positive_class_index = (
+        get_positive_class_index(
+            selected.pipeline
+        )
+    )
 
-    loaded_positive_class_index = get_positive_class_index(loaded_pipeline)
+    loaded_positive_class_index = (
+        get_positive_class_index(
+            loaded_pipeline
+        )
+    )
 
-    expected_probabilities = selected.pipeline.predict_proba(splits.X_validation)[
-        :, expected_positive_class_index
-    ]
+    expected_probabilities = (
+        selected.pipeline.predict_proba(
+            splits.X_validation
+        )[:, expected_positive_class_index]
+    )
 
-    loaded_probabilities = loaded_pipeline.predict_proba(splits.X_validation)[
-        :, loaded_positive_class_index
-    ]
+    loaded_probabilities = (
+        loaded_pipeline.predict_proba(
+            splits.X_validation
+        )[:, loaded_positive_class_index]
+    )
 
     if not np.allclose(
         expected_probabilities,
         loaded_probabilities,
     ):
         raise RuntimeError(
-            "Loaded model probabilities do not match the trained pipeline"
+            "Loaded model probabilities do not match "
+            "the selected pipeline"
         )
 
     logger.info(
         "Verified registered model: name=%s version=%s status=%s "
-        "loaded pipeline reproduces training-time predictions",
+        "loaded artifact reproduces validation predictions",
         registration.model_name,
         registration.model_version,
         model_version_details.status,
@@ -845,7 +1342,6 @@ def verify_registered_model(
 # -----------------------------------------------------------------------------
 # Reporting
 # -----------------------------------------------------------------------------
-
 
 def log_split_summary(
     splits: DatasetSplits,
@@ -865,9 +1361,15 @@ def log_split_summary(
         ),
     }
 
-    total_rows = sum(len(features) for features, _ in split_data.values())
+    total_rows = sum(
+        len(features)
+        for features, _ in split_data.values()
+    )
 
-    for split_name, (features, target) in split_data.items():
+    for split_name, (
+        features,
+        target,
+    ) in split_data.items():
         logger.info(
             "%s split: rows=%d proportion=%.4f positive_rate=%.4f",
             split_name,
@@ -884,48 +1386,66 @@ def log_fitted_pipeline_summary(
     candidate_name: str,
 ) -> None:
     """
-    Verify feature-schema consistency using preprocessing fitted on training.
+    Verify train/validation preprocessing compatibility.
+
+    The test partition is deliberately not transformed here.
     """
-    fitted_preprocessor = model_pipeline.named_steps["preprocessor"]
+    fitted_preprocessor = (
+        model_pipeline.named_steps[
+            "preprocessor"
+        ]
+    )
 
-    transformed_train = fitted_preprocessor.transform(splits.X_train)
+    transformed_train = (
+        fitted_preprocessor.transform(
+            splits.X_train
+        )
+    )
 
-    transformed_validation = fitted_preprocessor.transform(splits.X_validation)
-
-    transformed_test = fitted_preprocessor.transform(splits.X_test)
+    transformed_validation = (
+        fitted_preprocessor.transform(
+            splits.X_validation
+        )
+    )
 
     logger.info(
-        "%s transformed shapes: train=%s validation=%s test=%s",
+        "%s transformed shapes: train=%s validation=%s",
         candidate_name,
         transformed_train.shape,
         transformed_validation.shape,
-        transformed_test.shape,
     )
 
-    transformed_feature_counts = {
-        transformed_train.shape[1],
-        transformed_validation.shape[1],
-        transformed_test.shape[1],
-    }
-
-    if len(transformed_feature_counts) != 1:
+    if (
+        transformed_train.shape[1]
+        != transformed_validation.shape[1]
+    ):
         raise RuntimeError(
-            "Preprocessing produced inconsistent feature counts across partitions"
+            "Preprocessing produced inconsistent feature counts "
+            "between training and validation"
         )
 
-    feature_names = fitted_preprocessor.named_steps[
-        "column_preprocessing"
-    ].get_feature_names_out()
+    feature_names = (
+        fitted_preprocessor.named_steps[
+            "column_preprocessing"
+        ].get_feature_names_out()
+    )
 
-    if len(feature_names) != transformed_train.shape[1]:
+    if (
+        len(feature_names)
+        != transformed_train.shape[1]
+    ):
         raise RuntimeError(
-            "Transformed matrix width does not match generated feature-name count"
+            "Transformed matrix width does not match "
+            "generated feature-name count"
         )
 
-    classifier = model_pipeline.named_steps["classifier"]
+    classifier = model_pipeline.named_steps[
+        "classifier"
+    ]
 
     logger.info(
-        "%s fitted successfully: features=%d iterations=%s classes=%s",
+        "%s fitted successfully: "
+        "features=%d iterations=%s classes=%s",
         candidate_name,
         transformed_train.shape[1],
         classifier.n_iter_.tolist(),
@@ -934,25 +1454,39 @@ def log_fitted_pipeline_summary(
 
 
 def log_comparison_table(
-    evaluations: list[CandidateEvaluation],
+    evaluations: list[
+        CandidateEvaluation
+    ],
 ) -> None:
-    """
-    Print a concise side-by-side validation comparison.
-    """
     comparison = pd.DataFrame(
         [
             {
-                "candidate": evaluation.candidate.name,
+                "candidate": (
+                    evaluation.candidate.name
+                ),
                 "class_weight": (
                     evaluation.candidate.class_weight
-                    if evaluation.candidate.class_weight is not None
+                    if (
+                        evaluation.candidate.class_weight
+                        is not None
+                    )
                     else "None"
                 ),
-                "threshold": evaluation.metrics.threshold,
-                "roc_auc": evaluation.metrics.roc_auc,
-                "precision": evaluation.metrics.precision,
-                "recall": evaluation.metrics.recall,
-                "f1": evaluation.metrics.f1,
+                "threshold": (
+                    evaluation.metrics.threshold
+                ),
+                "roc_auc": (
+                    evaluation.metrics.roc_auc
+                ),
+                "precision": (
+                    evaluation.metrics.precision
+                ),
+                "recall": (
+                    evaluation.metrics.recall
+                ),
+                "f1": (
+                    evaluation.metrics.f1
+                ),
             }
             for evaluation in evaluations
         ]
@@ -962,7 +1496,9 @@ def log_comparison_table(
         "Validation candidate comparison:\n%s",
         comparison.to_string(
             index=False,
-            float_format=lambda value: f"{value:.6f}",
+            float_format=(
+                lambda value: f"{value:.6f}"
+            ),
         ),
     )
 
@@ -971,12 +1507,7 @@ def log_comparison_table(
 # Entrypoint
 # -----------------------------------------------------------------------------
 
-
 def main() -> None:
-    # ------------------------------------------------------------------
-    # Load and split once
-    # ------------------------------------------------------------------
-
     X, y = load_dataset()
 
     splits = create_stratified_splits(
@@ -984,13 +1515,13 @@ def main() -> None:
         y,
     )
 
-    log_split_summary(splits)
+    log_split_summary(
+        splits
+    )
 
-    # ------------------------------------------------------------------
-    # Evaluate controlled candidate set
-    # ------------------------------------------------------------------
-
-    evaluations: list[CandidateEvaluation] = []
+    evaluations: list[
+        CandidateEvaluation
+    ] = []
 
     for candidate in MODEL_CANDIDATES:
         evaluation = evaluate_candidate(
@@ -998,15 +1529,17 @@ def main() -> None:
             splits=splits,
         )
 
-        evaluations.append(evaluation)
+        evaluations.append(
+            evaluation
+        )
 
-    # ------------------------------------------------------------------
-    # Compare validation performance
-    # ------------------------------------------------------------------
+    log_comparison_table(
+        evaluations
+    )
 
-    log_comparison_table(evaluations)
-
-    selected = select_best_candidate(evaluations)
+    selected = select_best_candidate(
+        evaluations
+    )
 
     logger.info(
         "Selected candidate: %s",
@@ -1019,7 +1552,7 @@ def main() -> None:
     )
 
     logger.info(
-        "Selected operating threshold: %.6f",
+        "Selected operating threshold: %.12f",
         selected.metrics.threshold,
     )
 
@@ -1043,16 +1576,16 @@ def main() -> None:
         selected.metrics.f1,
     )
 
-    # ------------------------------------------------------------------
-    # Register the selected model in MLflow
-    # ------------------------------------------------------------------
-
-    _, registered_model_name = configure_mlflow()
+    _, registered_model_name = (
+        configure_mlflow()
+    )
 
     registration = register_selected_model(
         selected=selected,
         splits=splits,
-        registered_model_name=registered_model_name,
+        registered_model_name=(
+            registered_model_name
+        ),
     )
 
     verify_registered_model(
@@ -1061,15 +1594,20 @@ def main() -> None:
         splits=splits,
     )
 
-    # ------------------------------------------------------------------
-    # Explicit guardrail
-    # ------------------------------------------------------------------
-
-    logger.info("Model selection completed using training and validation data only")
+    logger.info(
+        "Training lifecycle completed using "
+        "training and validation data only."
+    )
 
     logger.info(
-        "Test split remains untouched: no test predictions or "
-        "test metrics have been computed"
+        "Registered model version ready for final test evaluation: "
+        "name=%s version=%s",
+        registration.model_name,
+        registration.model_version,
+    )
+
+    logger.info(
+        "Test labels and test model metrics remain unconsumed."
     )
 
 
