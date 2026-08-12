@@ -205,19 +205,43 @@ See [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ---
 
+## Live inference
+
+Model Service exposes a real `POST /predict` endpoint — not a stub. It runs the registered pipeline's `predict_proba` against the request and applies the frozen operating threshold, the same one selected during training:
+
+```bash
+curl -sS -X POST http://localhost:8020/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "age": 35, "job": "technician", "marital": "married",
+    "education": "university.degree", "default": "no", "housing": "yes",
+    "loan": "no", "contact": "cellular", "month": "may", "day_of_week": "mon",
+    "duration": 250, "campaign": 2, "pdays": 999, "previous": 0,
+    "poutcome": "nonexistent", "emp.var.rate": 1.1, "cons.price.idx": 93.994,
+    "cons.conf.idx": -36.4, "euribor3m": 4.857, "nr.employed": 5191.0
+  }'
+```
+
+```json
+{"model_name":"bank-marketing-classifier","model_version":"1","probability":0.3149,"threshold":0.385777,"prediction":0,"prediction_label":"no"}
+```
+
+The request schema intentionally matches the raw UCI dataset's columns exactly — including `duration` — because that is what the trained pipeline's domain transformer expects to receive. **`duration` is accepted but never used**: it is a known leakage feature (call duration is only knowable after a call ends), and `shared/preprocessing.py` drops it before the classifier ever sees it. This is documented directly on the field in the OpenAPI schema (`/docs`), not left as a silent unused parameter.
+
+The Dashboard (`http://localhost:8520`) has a "Try the Model" form that calls this same endpoint — the Dashboard never loads MLflow or the pipeline itself, it is purely an HTTP client, same as it's a read-only client to Postgres for investigations. The CI smoke test also calls `/predict` directly and re-derives the expected decision from the returned probability and threshold independently, rather than trusting the service applied its own threshold correctly.
+
 ## What's deliberately not built (yet)
 
 This project optimizes for a complete, correct *lifecycle* over feature breadth. Explicitly out of scope for now:
 
-- A real `/predict` inference endpoint (Model Service currently proves registry connectivity and artifact loading, not live scoring)
 - Real drift computation (PSI/χ² against live traffic) — the debug endpoint emits a deterministic signal for testing the downstream pipeline
-- Kubernetes, Prometheus/Grafana, a feature store, distributed training, online inference
+- Kubernetes, Prometheus/Grafana, a feature store, distributed training
+- A model promotion workflow (contract already documented in `DECISIONS.md`, not yet implemented)
 
 None of these change the core claim of the project — that the model lifecycle from training through registry through serving through incident response is real, tested, and reproducible — so they're not the next thing to add.
 
 ## Roadmap
 
-- [ ] Real `/predict` endpoint using the loaded pipeline
 - [ ] Live PSI/χ² drift computation replacing the deterministic debug signal
 - [ ] Model promotion workflow (human-approved, HMAC-authenticated, idempotent — contract already documented in `DECISIONS.md`)
 - [ ] `class_weight` sweep beyond the two-candidate comparison, once a second real dataset justifies it
@@ -227,6 +251,7 @@ None of these change the core claim of the project — that the model lifecycle 
 - **A clean-looking test pass can hide an empty artifact.** `training/evaluate.py` was committed with zero content for three commits — `ruff check`/`ruff format` both pass trivially on an empty file, and nothing failed until the file was actually read. The fix wasn't better tooling, it was checking file size, not just exit codes.
 - **Infrastructure that "works from the host" isn't proven.** MLflow's default DNS-rebinding protection only trusts `localhost` and private IPs — every test done against `localhost:5000` passed, and the very first time `model_service` reached it over the Docker network (`http://mlflow:5000`) it got a 403. The fix required reading MLflow's own security middleware source, not guessing.
 - **Moving code changes its identity.** Extracting `BankMarketingFeatureTransformer` into `shared/` changed the class's `__module__` at pickle time — a fresh model had to be trained and registered under the new path before `model_service` (which has no access to `training/`) could deserialize it at all.
+- **`bash -n` proves a script parses, not that it does the right thing.** A smoke-test assertion embedded a Python f-string using single quotes (`body['model_name']`) inside an outer *bash* single-quoted block. Bash single quotes have no escape mechanism at all, so that character silently closed and reopened the string mid-block — `bash -n` still reported clean syntax because the quotes happened to balance across the whole block, even though the argument actually passed to `python3` was garbled. The fix was extracting the values to plain variables first and interpolating those, avoiding nested quoting entirely.
 
 ---
 

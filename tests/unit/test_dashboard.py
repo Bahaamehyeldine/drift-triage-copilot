@@ -7,7 +7,9 @@ from datetime import UTC, datetime, timedelta, timezone
 import pandas as pd
 
 from dashboard.main import (
+    IGNORED_DURATION_PLACEHOLDER,
     DashboardMetrics,
+    build_prediction_payload,
     calculate_metrics,
     format_utc_timestamp,
 )
@@ -234,3 +236,95 @@ def test_calculate_metrics_counts_only_exact_status_matches() -> None:
         blocked_investigations=0,
         completed_jobs=1,
     )
+
+
+# -----------------------------------------------------------------------------
+# build_prediction_payload
+# -----------------------------------------------------------------------------
+
+
+def _prediction_form_values() -> dict[str, object]:
+    return {
+        "age": 35,
+        "job": "technician",
+        "marital": "married",
+        "education": "university.degree",
+        "default": "no",
+        "housing": "yes",
+        "loan": "no",
+        "contact": "cellular",
+        "month": "may",
+        "day_of_week": "mon",
+        "campaign": 2,
+        "pdays": 999,
+        "previous": 0,
+        "poutcome": "nonexistent",
+        "emp_var_rate": 1.1,
+        "cons_price_idx": 93.994,
+        "cons_conf_idx": -36.4,
+        "euribor3m": 4.857,
+        "nr_employed": 5191.0,
+    }
+
+
+def test_build_prediction_payload_uses_dotted_keys_for_economic_indicators() -> None:
+    """
+    Model Service's PredictionRequest expects the raw dataset's dotted
+    column names, not the Python-safe form field names.
+    """
+    payload = build_prediction_payload(**_prediction_form_values())
+
+    assert payload["emp.var.rate"] == 1.1
+    assert payload["cons.price.idx"] == 93.994
+    assert payload["cons.conf.idx"] == -36.4
+    assert payload["nr.employed"] == 5191.0
+    assert "emp_var_rate" not in payload
+
+
+def test_build_prediction_payload_never_sends_a_user_supplied_duration() -> None:
+    """
+    duration is not a form field: the payload always carries the fixed
+    placeholder, since it is dropped internally by the registered pipeline
+    and asking a user to guess it would be meaningless.
+    """
+    payload = build_prediction_payload(**_prediction_form_values())
+
+    assert payload["duration"] == IGNORED_DURATION_PLACEHOLDER
+
+
+def test_build_prediction_payload_preserves_the_never_contacted_sentinel() -> None:
+    values = _prediction_form_values()
+    values["pdays"] = 999
+
+    payload = build_prediction_payload(**values)
+
+    assert payload["pdays"] == 999
+
+
+def test_build_prediction_payload_includes_every_field_the_pipeline_requires() -> None:
+    payload = build_prediction_payload(**_prediction_form_values())
+
+    expected_keys = {
+        "age",
+        "job",
+        "marital",
+        "education",
+        "default",
+        "housing",
+        "loan",
+        "contact",
+        "month",
+        "day_of_week",
+        "duration",
+        "campaign",
+        "pdays",
+        "previous",
+        "poutcome",
+        "emp.var.rate",
+        "cons.price.idx",
+        "cons.conf.idx",
+        "euribor3m",
+        "nr.employed",
+    }
+
+    assert set(payload.keys()) == expected_keys

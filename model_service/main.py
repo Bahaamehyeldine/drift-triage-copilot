@@ -8,18 +8,20 @@ import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 import httpx
 import mlflow.sklearn
+import pandas as pd
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from sklearn.pipeline import Pipeline
 
 import mlflow
 from mlflow import MlflowClient
 from model_service.registry import ResolvedModelVersion, resolve_model_version
+from shared.inference import get_positive_class_index
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -66,10 +68,12 @@ class LoadedRegisteredModel:
 
     The registry is authoritative for model identity and operating threshold.
     The loaded sklearn Pipeline is retained in memory for the lifetime of the
-    service and will later be reused by the inference endpoint.
+    service and reused by /predict on every request. positive_class_index is
+    resolved once here rather than on every prediction request.
     """
 
     pipeline: Pipeline
+    positive_class_index: int
 
     name: str
     version: str
@@ -263,6 +267,7 @@ def load_registered_model() -> LoadedRegisteredModel:
 
     loaded_artifact = mlflow.sklearn.load_model(model_uri)
     pipeline = validate_loaded_pipeline(loaded_artifact)
+    positive_class_index = get_positive_class_index(pipeline)
     operating_threshold = resolve_operating_threshold(
         client=client, resolved_model=resolved_model
     )
@@ -278,6 +283,7 @@ def load_registered_model() -> LoadedRegisteredModel:
 
     return LoadedRegisteredModel(
         pipeline=pipeline,
+        positive_class_index=positive_class_index,
         name=resolved_model.name,
         version=resolved_model.version,
         run_id=resolved_model.run_id,
@@ -351,6 +357,142 @@ class ErrorResponse(BaseModel):
     report_id: str
     error: str
     details: str | None = None
+
+
+# -----------------------------------------------------------------------------
+# Prediction request/response models
+# -----------------------------------------------------------------------------
+
+POSITIVE_PREDICTION_LABEL: Final[str] = "yes"
+NEGATIVE_PREDICTION_LABEL: Final[str] = "no"
+
+
+class PredictionRequest(BaseModel):
+    """
+    Raw feature schema matching the UCI Bank Marketing dataset exactly.
+
+    The registered pipeline's domain transformer (shared/preprocessing.py)
+    expects these exact raw columns, including duration and pdays, which it
+    consumes internally before the classifier ever sees the data. This is a
+    deliberate choice to preserve the exact schema the trained pipeline
+    expects rather than inventing a slimmer serving-only schema.
+
+    Categorical fields are constrained to the exact category values observed
+    in the training data (verified directly against the raw CSV, not
+    assumed) so an invalid category is rejected with a clear 422 instead of
+    silently landing in scikit-learn's "unknown category" bucket.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    age: int = Field(ge=17, le=120, description="Client age in years.")
+    job: Literal[
+        "admin.",
+        "blue-collar",
+        "entrepreneur",
+        "housemaid",
+        "management",
+        "retired",
+        "self-employed",
+        "services",
+        "student",
+        "technician",
+        "unemployed",
+        "unknown",
+    ]
+    marital: Literal["divorced", "married", "single", "unknown"]
+    education: Literal[
+        "basic.4y",
+        "basic.6y",
+        "basic.9y",
+        "high.school",
+        "illiterate",
+        "professional.course",
+        "university.degree",
+        "unknown",
+    ]
+    default: Literal["no", "unknown", "yes"] = Field(
+        description="Has credit in default?"
+    )
+    housing: Literal["no", "unknown", "yes"] = Field(description="Has a housing loan?")
+    loan: Literal["no", "unknown", "yes"] = Field(description="Has a personal loan?")
+    contact: Literal["cellular", "telephone"]
+    month: Literal[
+        "apr", "aug", "dec", "jul", "jun", "mar", "may", "nov", "oct", "sep"
+    ] = Field(description="Month of last contact.")
+    day_of_week: Literal["fri", "mon", "thu", "tue", "wed"]
+    duration: int = Field(
+        ge=0,
+        description=(
+            "Duration in seconds of the last contact call. Required for "
+            "schema compatibility with the trained pipeline, but dropped "
+            "internally and never used in the prediction — it is a known "
+            "leakage feature (duration is only known after a call ends). "
+            "Any value is accepted."
+        ),
+    )
+    campaign: int = Field(
+        ge=1,
+        description="Number of contacts performed for this client in this campaign.",
+    )
+    pdays: int = Field(
+        ge=0,
+        le=999,
+        description=(
+            "Days since last contact from a previous campaign. "
+            "999 means never previously contacted."
+        ),
+    )
+    previous: int = Field(ge=0, description="Number of contacts before this campaign.")
+    poutcome: Literal["failure", "nonexistent", "success"] = Field(
+        description="Outcome of the previous marketing campaign."
+    )
+    emp_var_rate: float = Field(
+        alias="emp.var.rate",
+        description="Employment variation rate (quarterly indicator).",
+    )
+    cons_price_idx: float = Field(
+        alias="cons.price.idx",
+        description="Consumer price index (monthly indicator).",
+    )
+    cons_conf_idx: float = Field(
+        alias="cons.conf.idx",
+        description="Consumer confidence index (monthly indicator).",
+    )
+    euribor3m: float = Field(description="Euribor 3-month rate (daily indicator).")
+    nr_employed: float = Field(
+        alias="nr.employed", description="Number of employees (quarterly indicator)."
+    )
+
+
+class PredictionResponse(BaseModel):
+    model_name: str
+    model_version: str
+    probability: float
+    threshold: float
+    prediction: int
+    prediction_label: str
+
+
+def decide_prediction(
+    *,
+    probability: float,
+    threshold: float,
+) -> tuple[int, str]:
+    """
+    Apply the registered model's frozen decision rule to one probability.
+
+    A pure function so the boundary condition (probability exactly equal to
+    the threshold counts as a positive prediction, matching the >= used
+    throughout training/evaluate.py) is directly unit-testable without a
+    live model or an HTTP request.
+    """
+    prediction = 1 if probability >= threshold else 0
+    prediction_label = (
+        POSITIVE_PREDICTION_LABEL if prediction == 1 else NEGATIVE_PREDICTION_LABEL
+    )
+
+    return prediction, prediction_label
 
 
 def get_deployed_model(request: Request) -> LoadedRegisteredModel:
@@ -475,6 +617,56 @@ async def health() -> dict[str, str]:
         "status": "ok",
         "timestamp": datetime.now(UTC).isoformat(),
     }
+
+
+@app.post(
+    "/predict",
+    response_model=PredictionResponse,
+)
+async def predict(
+    request: Request,
+    payload: PredictionRequest,
+) -> PredictionResponse:
+    """
+    Score one customer against the registered model's frozen decision rule.
+
+    Inference only: this is a single predict_proba call over one row, not an
+    evaluation. It never touches the sealed test set and never computes an
+    aggregate metric — see training/evaluate.py for that.
+    """
+    deployed_model = get_deployed_model(request)
+
+    row = pd.DataFrame([payload.model_dump(by_alias=True)])
+
+    probability = float(
+        deployed_model.pipeline.predict_proba(row)[
+            :, deployed_model.positive_class_index
+        ][0]
+    )
+
+    prediction, prediction_label = decide_prediction(
+        probability=probability,
+        threshold=deployed_model.operating_threshold,
+    )
+
+    logger.info(
+        "Prediction served: model=%s version=%s probability=%.6f "
+        "threshold=%.6f prediction=%s",
+        deployed_model.name,
+        deployed_model.version,
+        probability,
+        deployed_model.operating_threshold,
+        prediction_label,
+    )
+
+    return PredictionResponse(
+        model_name=deployed_model.name,
+        model_version=deployed_model.version,
+        probability=probability,
+        threshold=deployed_model.operating_threshold,
+        prediction=prediction,
+        prediction_label=prediction_label,
+    )
 
 
 @app.post(

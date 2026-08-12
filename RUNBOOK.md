@@ -400,6 +400,27 @@ uv run --with-requirements training/requirements.txt python3 -m training.predict
 
 Loads the registered model and scores a handful of real validation-split rows, printing predicted probability, threshold, predicted label, and ground truth side by side. Never touches the sealed test set.
 
+### Live inference via Model Service
+
+Once Model Service is up with a model loaded, it serves real predictions directly — this is what the Dashboard's "Try the Model" form and the integration smoke test both call:
+
+```bash
+curl -sS -X POST http://localhost:8020/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "age": 35, "job": "technician", "marital": "married",
+    "education": "university.degree", "default": "no", "housing": "yes",
+    "loan": "no", "contact": "cellular", "month": "may", "day_of_week": "mon",
+    "duration": 250, "campaign": 2, "pdays": 999, "previous": 0,
+    "poutcome": "nonexistent", "emp.var.rate": 1.1, "cons.price.idx": 93.994,
+    "cons.conf.idx": -36.4, "euribor3m": 4.857, "nr.employed": 5191.0
+  }'
+```
+
+The request schema matches the raw UCI dataset's columns exactly, including `duration` — the registered pipeline's domain transformer requires the column to be present, but `shared/preprocessing.py` drops it internally before the classifier sees it. **`duration` is accepted but never affects the prediction**; it's a known leakage feature (only knowable after a call ends), and the Dashboard form does not ask a user for it, sending a fixed placeholder instead.
+
+Full interactive schema and category values: `http://localhost:8020/docs`.
+
 ### Pinning a specific version
 
 By default `MODEL_VERSION` is unset, which resolves to `latest` (highest registered version number). To pin Model Service to a specific version instead:
@@ -2078,6 +2099,12 @@ Trigger drift:
 
 ```bash
 curl -X POST http://localhost:8020/debug/drift
+```
+
+Request a live prediction (see [Live inference via Model Service](#live-inference-via-model-service) above for the full field list):
+
+```bash
+curl -X POST http://localhost:8020/predict -H "Content-Type: application/json" -d '{...}'
 ```
 
 Open Dashboard:

@@ -25,6 +25,7 @@ from sklearn.pipeline import Pipeline
 
 import mlflow
 from mlflow import MlflowClient
+from shared.inference import get_positive_class_index
 from training.preprocess import build_preprocessor
 
 # -----------------------------------------------------------------------------
@@ -598,30 +599,6 @@ def build_model_pipeline(
             ),
         ]
     )
-
-
-# -----------------------------------------------------------------------------
-# Probability handling
-# -----------------------------------------------------------------------------
-
-
-def get_positive_class_index(
-    model_pipeline: Pipeline,
-) -> int:
-    """
-    Resolve the predict_proba column corresponding to positive class 1.
-    """
-    classifier = model_pipeline.named_steps["classifier"]
-
-    matching_indices = np.flatnonzero(classifier.classes_ == 1)
-
-    if len(matching_indices) != 1:
-        raise RuntimeError(
-            "Expected exactly one positive class labeled 1; "
-            f"found classes={classifier.classes_.tolist()}"
-        )
-
-    return int(matching_indices[0])
 
 
 # -----------------------------------------------------------------------------

@@ -63,10 +63,10 @@ The Model Service is the authoritative owner of the machine learning lifecycle. 
 
 **Implemented today:**
 - MLflow Registry — read path only: resolves and loads a registered model version at startup (`model_service/registry.py`, `main.py`'s `lifespan`), fails fast if the registry is empty or the artifact is structurally invalid. Does **not** perform registration — that happens in `training/train.py`, a separate host-side component.
+- Model inference — `POST /predict` runs the loaded pipeline's `predict_proba` and applies the frozen operating threshold from the registered model version's tags. Exercised directly by the integration smoke test and by the Dashboard's prediction form (an HTTP client, not a direct MLflow/pipeline consumer).
 
 **Target, not yet built:**
 - Model training (owned by the separate `training/` subsystem, not the Model Service process)
-- Model inference (no `/predict` endpoint)
 - Drift computation (the debug endpoint emits a deterministic hardcoded signal, not PSI/χ² against live traffic)
 - Drift reports (no persisted drift-report table)
 - Promotion validation and model promotion (no promotion endpoint exists)

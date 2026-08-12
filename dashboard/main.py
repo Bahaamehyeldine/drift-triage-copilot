@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final
 
+import httpx
 import pandas as pd
 import sqlalchemy as sa
 import streamlit as st
@@ -41,16 +42,24 @@ EMPTY_VALUE: Final[str] = "—"
 INVESTIGATION_STATUS_OPEN: Final[str] = "open"
 JOB_STATUS_COMPLETED: Final[str] = "completed"
 
+DEFAULT_MODEL_SERVICE_URL: Final[str] = "http://model_service:8000"
+
 
 @dataclass(frozen=True)
 class Settings:
     """
     Runtime configuration loaded from environment variables.
 
-    The Dashboard has one mandatory dependency: Postgres.
+    Postgres is a mandatory dependency: the Dashboard cannot render its core
+    monitoring view without it. Model Service is not — the prediction form
+    is an additional feature that degrades to a visible error if Model
+    Service is unreachable, rather than taking down investigation
+    monitoring, so MODEL_SERVICE_URL has a working default instead of being
+    a hard startup requirement.
     """
 
     database_url: str
+    model_service_url: str
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -59,8 +68,14 @@ class Settings:
         if not database_url:
             raise RuntimeError("DATABASE_URL is not configured")
 
+        model_service_url = (
+            os.getenv("MODEL_SERVICE_URL", DEFAULT_MODEL_SERVICE_URL).strip()
+            or DEFAULT_MODEL_SERVICE_URL
+        )
+
         return cls(
             database_url=database_url,
+            model_service_url=model_service_url,
         )
 
 
@@ -465,6 +480,347 @@ def calculate_metrics(
 
 
 # -----------------------------------------------------------------------------
+# Prediction form
+#
+# The Dashboard never loads MLflow or the sklearn pipeline itself. It is an
+# HTTP client to Model Service's /predict endpoint, same as it is a read
+# client to Postgres for investigations — inference ownership stays inside
+# Model Service.
+# -----------------------------------------------------------------------------
+
+JOB_OPTIONS: Final[tuple[str, ...]] = (
+    "admin.",
+    "blue-collar",
+    "entrepreneur",
+    "housemaid",
+    "management",
+    "retired",
+    "self-employed",
+    "services",
+    "student",
+    "technician",
+    "unemployed",
+    "unknown",
+)
+
+MARITAL_OPTIONS: Final[tuple[str, ...]] = ("divorced", "married", "single", "unknown")
+
+EDUCATION_OPTIONS: Final[tuple[str, ...]] = (
+    "basic.4y",
+    "basic.6y",
+    "basic.9y",
+    "high.school",
+    "illiterate",
+    "professional.course",
+    "university.degree",
+    "unknown",
+)
+
+YES_NO_UNKNOWN_OPTIONS: Final[tuple[str, ...]] = ("no", "unknown", "yes")
+
+CONTACT_OPTIONS: Final[tuple[str, ...]] = ("cellular", "telephone")
+
+MONTH_OPTIONS: Final[tuple[str, ...]] = (
+    "mar",
+    "apr",
+    "may",
+    "jun",
+    "jul",
+    "aug",
+    "sep",
+    "oct",
+    "nov",
+    "dec",
+)
+
+DAY_OF_WEEK_OPTIONS: Final[tuple[str, ...]] = ("mon", "tue", "wed", "thu", "fri")
+
+POUTCOME_OPTIONS: Final[tuple[str, ...]] = ("failure", "nonexistent", "success")
+
+# duration is part of Model Service's /predict schema (the registered
+# pipeline's domain transformer requires the column to be present), but it
+# is dropped internally before the classifier ever sees it — a known
+# leakage feature, since call duration is only known after a call ends.
+# Asking a user to guess it for a not-yet-made call would be meaningless,
+# so the form does not expose it and a fixed placeholder is sent instead.
+IGNORED_DURATION_PLACEHOLDER: Final[int] = 0
+
+NEVER_PREVIOUSLY_CONTACTED_SENTINEL: Final[int] = 999
+
+
+class PredictionRequestError(Exception):
+    """
+    Raised when Model Service's /predict call fails for any reason.
+
+    Carries a message already safe to show directly in the UI.
+    """
+
+
+def build_prediction_payload(
+    *,
+    age: int,
+    job: str,
+    marital: str,
+    education: str,
+    default: str,
+    housing: str,
+    loan: str,
+    contact: str,
+    month: str,
+    day_of_week: str,
+    campaign: int,
+    pdays: int,
+    previous: int,
+    poutcome: str,
+    emp_var_rate: float,
+    cons_price_idx: float,
+    cons_conf_idx: float,
+    euribor3m: float,
+    nr_employed: float,
+) -> dict[str, object]:
+    """
+    Build the exact raw payload Model Service's PredictionRequest expects.
+
+    A pure function, kept separate from the Streamlit form so the field
+    mapping (in particular the dotted keys the registered pipeline expects)
+    is directly testable without a running Streamlit session.
+    """
+    return {
+        "age": age,
+        "job": job,
+        "marital": marital,
+        "education": education,
+        "default": default,
+        "housing": housing,
+        "loan": loan,
+        "contact": contact,
+        "month": month,
+        "day_of_week": day_of_week,
+        "duration": IGNORED_DURATION_PLACEHOLDER,
+        "campaign": campaign,
+        "pdays": pdays,
+        "previous": previous,
+        "poutcome": poutcome,
+        "emp.var.rate": emp_var_rate,
+        "cons.price.idx": cons_price_idx,
+        "cons.conf.idx": cons_conf_idx,
+        "euribor3m": euribor3m,
+        "nr.employed": nr_employed,
+    }
+
+
+def call_predict_endpoint(
+    *,
+    base_url: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    """
+    Call Model Service's /predict endpoint and return the parsed JSON body.
+
+    Raises PredictionRequestError on any failure — network error, non-2xx
+    response, or an unparseable body — so the caller has one error path to
+    render rather than several exception types to catch.
+    """
+    url = f"{base_url.rstrip('/')}/predict"
+
+    try:
+        response = httpx.post(
+            url,
+            json=payload,
+            timeout=10.0,
+        )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:500]
+        raise PredictionRequestError(
+            f"Model Service rejected the request (HTTP {exc.response.status_code}): "
+            f"{detail}"
+        ) from exc
+    except httpx.RequestError as exc:
+        raise PredictionRequestError(f"Could not reach Model Service: {exc}") from exc
+
+    return response.json()
+
+
+def render_prediction_form(
+    model_service_url: str,
+) -> None:
+    st.subheader("Try the Model")
+
+    st.caption(
+        "Score a hypothetical customer against the currently registered "
+        "model. Inference happens inside Model Service, not here — the "
+        "Dashboard only sends the request and renders the response."
+    )
+
+    with st.form("prediction_form"):
+        column_1, column_2, column_3, column_4 = st.columns(4)
+
+        with column_1:
+            age = st.number_input("Age", min_value=17, max_value=120, value=35)
+            job = st.selectbox(
+                "Job", JOB_OPTIONS, index=JOB_OPTIONS.index("technician")
+            )
+            marital = st.selectbox(
+                "Marital status",
+                MARITAL_OPTIONS,
+                index=MARITAL_OPTIONS.index("married"),
+            )
+
+        with column_2:
+            education = st.selectbox(
+                "Education",
+                EDUCATION_OPTIONS,
+                index=EDUCATION_OPTIONS.index("university.degree"),
+            )
+            default = st.selectbox(
+                "Credit in default?",
+                YES_NO_UNKNOWN_OPTIONS,
+                index=YES_NO_UNKNOWN_OPTIONS.index("no"),
+            )
+            housing = st.selectbox(
+                "Housing loan?",
+                YES_NO_UNKNOWN_OPTIONS,
+                index=YES_NO_UNKNOWN_OPTIONS.index("yes"),
+            )
+
+        with column_3:
+            loan = st.selectbox(
+                "Personal loan?",
+                YES_NO_UNKNOWN_OPTIONS,
+                index=YES_NO_UNKNOWN_OPTIONS.index("no"),
+            )
+            contact = st.selectbox(
+                "Contact type", CONTACT_OPTIONS, index=CONTACT_OPTIONS.index("cellular")
+            )
+            month = st.selectbox(
+                "Month of last contact", MONTH_OPTIONS, index=MONTH_OPTIONS.index("may")
+            )
+
+        with column_4:
+            day_of_week = st.selectbox(
+                "Day of last contact",
+                DAY_OF_WEEK_OPTIONS,
+                index=DAY_OF_WEEK_OPTIONS.index("mon"),
+            )
+            campaign = st.number_input("Contacts this campaign", min_value=1, value=2)
+            previous = st.number_input(
+                "Contacts before this campaign", min_value=0, value=0
+            )
+
+        st.divider()
+
+        column_5, column_6 = st.columns(2)
+
+        with column_5:
+            never_previously_contacted = st.checkbox(
+                "Never previously contacted", value=True
+            )
+
+            if never_previously_contacted:
+                pdays = NEVER_PREVIOUSLY_CONTACTED_SENTINEL
+            else:
+                pdays = st.number_input(
+                    "Days since last previous contact",
+                    min_value=0,
+                    max_value=998,
+                    value=3,
+                )
+
+            poutcome = st.selectbox(
+                "Outcome of previous campaign",
+                POUTCOME_OPTIONS,
+                index=POUTCOME_OPTIONS.index("nonexistent"),
+            )
+
+        with column_6:
+            st.caption(
+                "Economic indicators at the time of contact "
+                "(quarterly / monthly / daily figures)."
+            )
+            emp_var_rate = st.number_input(
+                "Employment variation rate", value=1.1, format="%.2f"
+            )
+            cons_price_idx = st.number_input(
+                "Consumer price index", value=93.994, format="%.3f"
+            )
+            cons_conf_idx = st.number_input(
+                "Consumer confidence index", value=-36.4, format="%.1f"
+            )
+            euribor3m = st.number_input(
+                "Euribor 3-month rate", value=4.857, format="%.3f"
+            )
+            nr_employed = st.number_input(
+                "Number of employees", value=5191.0, format="%.1f"
+            )
+
+        submitted = st.form_submit_button("Predict", type="primary")
+
+    if not submitted:
+        return
+
+    payload = build_prediction_payload(
+        age=int(age),
+        job=job,
+        marital=marital,
+        education=education,
+        default=default,
+        housing=housing,
+        loan=loan,
+        contact=contact,
+        month=month,
+        day_of_week=day_of_week,
+        campaign=int(campaign),
+        pdays=int(pdays),
+        previous=int(previous),
+        poutcome=poutcome,
+        emp_var_rate=float(emp_var_rate),
+        cons_price_idx=float(cons_price_idx),
+        cons_conf_idx=float(cons_conf_idx),
+        euribor3m=float(euribor3m),
+        nr_employed=float(nr_employed),
+    )
+
+    try:
+        result = call_predict_endpoint(
+            base_url=model_service_url,
+            payload=payload,
+        )
+    except PredictionRequestError as exc:
+        logger.error("Prediction request failed: %s", exc)
+        st.error(str(exc))
+        return
+
+    render_prediction_result(result)
+
+
+def render_prediction_result(
+    result: dict[str, object],
+) -> None:
+    probability = float(result["probability"])
+    threshold = float(result["threshold"])
+    prediction_label = str(result["prediction_label"])
+
+    st.divider()
+    st.subheader("Prediction")
+
+    column_1, column_2, column_3 = st.columns(3)
+
+    column_1.metric("Probability of subscription", f"{probability:.2%}")
+    column_2.metric("Operating threshold", f"{threshold:.2%}")
+
+    with column_3:
+        if prediction_label == "yes":
+            st.success(f"Decision: {prediction_label.upper()}")
+        else:
+            st.info(f"Decision: {prediction_label.upper()}")
+
+    st.progress(min(max(probability, 0.0), 1.0))
+
+    st.caption(f"Model: {result['model_name']} version {result['model_version']}")
+
+
+# -----------------------------------------------------------------------------
 # Streamlit rendering
 # -----------------------------------------------------------------------------
 
@@ -672,6 +1028,10 @@ def main() -> None:
     st.divider()
 
     render_investigation_table(dataframe)
+
+    st.divider()
+
+    render_prediction_form(settings.model_service_url)
 
     render_last_refresh_time()
 
