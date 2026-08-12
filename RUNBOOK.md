@@ -1260,7 +1260,7 @@ If the redis-py socket timeout is also five seconds or shorter, the client may t
 The Redis client socket timeout must exceed the blocking window:
 
 ```python
-socket_timeout=(REDIS_BLOCK_MS / 1000) + 5
+socket_timeout = (REDIS_BLOCK_MS / 1000) + 5
 ```
 
 The extra margin ensures the client outlives the server-side blocking period.

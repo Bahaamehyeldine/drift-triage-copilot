@@ -10,7 +10,6 @@ from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-
 PDAYS_SENTINEL: Final[int] = 999
 LEAKAGE_FEATURES: Final[list[str]] = ["duration"]
 
@@ -84,9 +83,7 @@ class BankMarketingFeatureTransformer(
         ).astype("int8")
 
         transformed["pdays_since_previous_contact"] = (
-            transformed["pdays"]
-            .replace(PDAYS_SENTINEL, np.nan)
-            .astype("float64")
+            transformed["pdays"].replace(PDAYS_SENTINEL, np.nan).astype("float64")
         )
 
         transformed = transformed.drop(
@@ -110,14 +107,11 @@ class BankMarketingFeatureTransformer(
             *LEAKAGE_FEATURES,
         }
 
-        missing_columns = sorted(
-            required_columns.difference(X.columns)
-        )
+        missing_columns = sorted(required_columns.difference(X.columns))
 
         if missing_columns:
             raise ValueError(
-                "Input data is missing required columns: "
-                + ", ".join(missing_columns)
+                "Input data is missing required columns: " + ", ".join(missing_columns)
             )
 
 

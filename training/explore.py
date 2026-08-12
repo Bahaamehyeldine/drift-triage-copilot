@@ -2,7 +2,6 @@ from pathlib import Path
 
 import pandas as pd
 
-
 DATASET_PATH = Path("data/bank-additional-full.csv")
 
 
