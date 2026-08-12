@@ -78,7 +78,7 @@ DEFAULT_MLFLOW_EXPERIMENT_NAME: Final[str] = "bank-marketing"
 DEFAULT_MLFLOW_REGISTERED_MODEL_NAME: Final[str] = "bank-marketing-classifier"
 
 MLFLOW_TRUSTED_MODEL_TYPES: Final[tuple[str, ...]] = (
-    "training.preprocess.BankMarketingFeatureTransformer",
+    "shared.preprocessing.BankMarketingFeatureTransformer",
     "numpy.dtype",
 )
 
@@ -123,7 +123,7 @@ class DatasetSplits:
     """
     Raw train, validation, and test partitions.
 
-    All learned preprocessing is fitted only after these partitions exist.
+    Learned preprocessing is fitted only after these partitions exist.
     """
 
     X_train: pd.DataFrame
@@ -151,7 +151,7 @@ class ValidationMetrics:
 @dataclass(frozen=True)
 class ModelCandidate:
     """
-    One explicitly controlled model candidate.
+    One explicitly controlled logistic-regression candidate.
     """
 
     name: str
@@ -161,7 +161,7 @@ class ModelCandidate:
 @dataclass(frozen=True)
 class CandidateEvaluation:
     """
-    Trained candidate plus validation evaluation.
+    One trained candidate and its validation evaluation.
     """
 
     candidate: ModelCandidate
@@ -172,7 +172,7 @@ class CandidateEvaluation:
 @dataclass(frozen=True)
 class ModelRegistration:
     """
-    MLflow identifiers for the registered winning model.
+    MLflow identifiers for one registered model artifact.
     """
 
     run_id: str
@@ -210,7 +210,7 @@ def sha256_bytes(payload: bytes) -> str:
 
 def sha256_canonical_json(payload: object) -> str:
     """
-    Hash a JSON-serializable value using deterministic serialization.
+    Hash a JSON-serializable object using deterministic serialization.
     """
     encoded = json.dumps(
         payload,
@@ -248,10 +248,10 @@ def compute_file_sha256(path: Path) -> str:
 
 def build_split_specification() -> dict[str, str | int | float]:
     """
-    Return the canonical configuration defining the dataset split.
+    Return the canonical configuration defining dataset partitioning.
 
-    SPLIT_STRATEGY_VERSION must change deliberately if the split algorithm
-    itself changes in a way that can alter partition membership.
+    SPLIT_STRATEGY_VERSION should be changed deliberately if the splitting
+    algorithm changes in a way that could alter partition membership.
     """
     return {
         "strategy": SPLIT_STRATEGY_VERSION,
@@ -265,7 +265,7 @@ def build_split_specification() -> dict[str, str | int | float]:
 
 def compute_split_spec_sha256() -> str:
     """
-    Fingerprint the split configuration independently of actual row membership.
+    Fingerprint the split configuration independently of row membership.
     """
     return sha256_canonical_json(build_split_specification())
 
@@ -274,10 +274,7 @@ def _canonical_index_membership(
     index: pd.Index,
 ) -> list[int]:
     """
-    Normalize row membership for deterministic hashing.
-
-    The committed UCI dataset loads with a RangeIndex, so integer source-row
-    indexes are the stable row identifiers for this training vertical.
+    Normalize source-row membership into a deterministic representation.
     """
     normalized: list[int] = []
 
@@ -297,11 +294,7 @@ def compute_split_membership_sha256(
     splits: DatasetSplits,
 ) -> str:
     """
-    Fingerprint the exact source-row membership of every partition.
-
-    This is stronger than storing only random_state and split percentages:
-    even if split implementation changes later, a membership mismatch will be
-    detected before final test evaluation.
+    Fingerprint the exact source-row membership of all partitions.
     """
     membership = {
         "train": _canonical_index_membership(splits.X_train.index),
@@ -319,10 +312,9 @@ def compute_split_membership_sha256(
 
 def resolve_git_commit_sha() -> str:
     """
-    Resolve the repository commit that produced the training execution.
+    Resolve the Git commit associated with the training execution.
 
-    Returns "unknown" when Git metadata is unavailable, for example when the
-    code is executed from an exported source archive.
+    Returns "unknown" if Git metadata cannot be resolved.
     """
     try:
         result = subprocess.run(
@@ -348,10 +340,9 @@ def resolve_git_commit_sha() -> str:
 
 def resolve_git_worktree_dirty() -> bool:
     """
-    Record whether training ran with uncommitted repository changes.
+    Determine whether training is running with uncommitted changes.
 
-    This prevents a clean Git SHA from falsely implying that the running
-    source code exactly matched the referenced commit.
+    If Git status cannot be determined, return True conservatively.
     """
     try:
         result = subprocess.run(
@@ -459,7 +450,7 @@ def create_stratified_splits(
     y: pd.Series,
 ) -> DatasetSplits:
     """
-    Create deterministic stratified 60/20/20 partitions.
+    Create deterministic stratified 60/20/20 train/validation/test splits.
     """
     total_fraction = TRAIN_SIZE + VALIDATION_SIZE + TEST_SIZE
 
@@ -552,7 +543,9 @@ def validate_splits(
             )
 
     train_indexes = set(splits.X_train.index)
+
     validation_indexes = set(splits.X_validation.index)
+
     test_indexes = set(splits.X_test.index)
 
     if train_indexes & validation_indexes:
@@ -580,6 +573,9 @@ def build_model_pipeline(
 ) -> Pipeline:
     """
     Build one controlled logistic-regression candidate.
+
+    All candidates use identical preprocessing and hyperparameters except for
+    class_weight, which is the one deliberately varied experimental factor.
     """
     classifier = LogisticRegression(
         C=MODEL_C,
@@ -613,7 +609,7 @@ def get_positive_class_index(
     model_pipeline: Pipeline,
 ) -> int:
     """
-    Resolve the predict_proba column corresponding to class 1.
+    Resolve the predict_proba column corresponding to positive class 1.
     """
     classifier = model_pipeline.named_steps["classifier"]
 
@@ -642,6 +638,11 @@ def evaluate_validation_threshold(
 ) -> ValidationMetrics:
     """
     Select the highest validation threshold satisfying the recall constraint.
+
+    Selection rule:
+
+        maximize threshold
+        subject to recall >= minimum_recall
     """
     if not 0.0 <= minimum_recall <= 1.0:
         raise ValueError("minimum_recall must be between 0.0 and 1.0")
@@ -677,6 +678,7 @@ def evaluate_validation_threshold(
         raise RuntimeError("precision_recall_curve produced no candidate thresholds")
 
     threshold_precision = curve_precision[:-1]
+
     threshold_recall = curve_recall[:-1]
 
     if not (len(thresholds) == len(threshold_precision) == len(threshold_recall)):
@@ -763,7 +765,7 @@ def evaluate_candidate(
     splits: DatasetSplits,
 ) -> CandidateEvaluation:
     """
-    Train on training data and evaluate on validation data only.
+    Fit one candidate using training data and evaluate on validation only.
     """
     logger.info(
         "Training candidate: %s class_weight=%s",
@@ -817,10 +819,10 @@ def select_best_candidate(
     Select the final candidate using validation data only.
 
     Policy:
-        1. recall constraint must be satisfied;
-        2. maximize validation F1;
-        3. precision is first tie-breaker;
-        4. ROC AUC is second tie-breaker.
+    1. every candidate must satisfy recall >= 0.75;
+    2. maximize validation F1;
+    3. precision is the first tie-breaker;
+    4. ROC AUC is the second tie-breaker.
     """
     if not evaluations:
         raise ValueError("No candidate evaluations were provided")
@@ -853,7 +855,7 @@ def build_training_provenance(
     dataset_path: Path = DATASET_PATH,
 ) -> dict[str, str]:
     """
-    Construct immutable provenance metadata for the model run.
+    Construct provenance metadata for the exact training execution.
     """
     dataset_sha256 = compute_file_sha256(dataset_path)
 
@@ -862,11 +864,12 @@ def build_training_provenance(
     split_membership_sha256 = compute_split_membership_sha256(splits)
 
     git_commit_sha = resolve_git_commit_sha()
+
     git_worktree_dirty = resolve_git_worktree_dirty()
 
     provenance = {
-        DATASET_SHA256_KEY: dataset_sha256,
-        SPLIT_SPEC_SHA256_KEY: split_spec_sha256,
+        DATASET_SHA256_KEY: (dataset_sha256),
+        SPLIT_SPEC_SHA256_KEY: (split_spec_sha256),
         SPLIT_MEMBERSHIP_SHA256_KEY: (split_membership_sha256),
         DATASET_PATH_KEY: str(dataset_path),
         SPLIT_STRATEGY_KEY: (SPLIT_STRATEGY_VERSION),
@@ -874,12 +877,13 @@ def build_training_provenance(
         TRAIN_SIZE_KEY: repr(TRAIN_SIZE),
         VALIDATION_SIZE_KEY: repr(VALIDATION_SIZE),
         TEST_SIZE_KEY: repr(TEST_SIZE),
-        GIT_COMMIT_SHA_KEY: git_commit_sha,
+        GIT_COMMIT_SHA_KEY: (git_commit_sha),
         GIT_WORKTREE_DIRTY_KEY: (str(git_worktree_dirty).lower()),
     }
 
     logger.info(
-        "Training provenance: dataset_sha256=%s "
+        "Training provenance: "
+        "dataset_sha256=%s "
         "split_spec_sha256=%s "
         "split_membership_sha256=%s "
         "git_commit_sha=%s dirty=%s",
@@ -903,7 +907,7 @@ def configure_mlflow() -> tuple[
     str,
 ]:
     """
-    Configure tracking server, experiment, and registry target.
+    Configure MLflow tracking, experiment, and registry target.
     """
     tracking_uri = os.environ.get(
         "MLFLOW_TRACKING_URI",
@@ -944,7 +948,8 @@ def register_selected_model(
     registered_model_name: str,
 ) -> ModelRegistration:
     """
-    Persist the selected candidate and its full provenance in MLflow.
+    Persist the selected candidate, validation metrics, threshold, and
+    reproducibility provenance in MLflow.
     """
     classifier = selected.pipeline.named_steps["classifier"]
 
@@ -968,8 +973,8 @@ def register_selected_model(
                 ),
                 "C": classifier.C,
                 "l1_ratio": (classifier.l1_ratio),
-                "solver": classifier.solver,
-                "max_iter": classifier.max_iter,
+                "solver": (classifier.solver),
+                "max_iter": (classifier.max_iter),
                 "random_state": (classifier.random_state),
                 "minimum_validation_recall": (MINIMUM_VALIDATION_RECALL),
                 **provenance,
@@ -988,7 +993,7 @@ def register_selected_model(
 
         mlflow.set_tag(
             OPERATING_THRESHOLD_TAG,
-            f"{selected.metrics.threshold:.12f}",
+            (f"{selected.metrics.threshold:.12f}"),
         )
 
         model_info = mlflow.sklearn.log_model(
@@ -1044,7 +1049,9 @@ def verify_registered_model(
     splits: DatasetSplits,
 ) -> None:
     """
-    Reload the registered model and prove serialization fidelity.
+    Reload the registered artifact and verify serialization fidelity.
+
+    Test data is deliberately not used here.
     """
     client = MlflowClient()
 
@@ -1055,8 +1062,8 @@ def verify_registered_model(
 
     if model_version_details.run_id != registration.run_id:
         raise RuntimeError(
-            "Registered model version is not linked to "
-            "the expected run: "
+            "Registered model version is not linked "
+            "to the expected run: "
             f"expected={registration.run_id}, "
             f"found={model_version_details.run_id}"
         )
@@ -1098,7 +1105,8 @@ def verify_registered_model(
         )
 
     logger.info(
-        "Verified registered model: name=%s version=%s status=%s "
+        "Verified registered model: "
+        "name=%s version=%s status=%s "
         "loaded artifact reproduces validation predictions",
         registration.model_name,
         registration.model_version,
@@ -1114,6 +1122,9 @@ def verify_registered_model(
 def log_split_summary(
     splits: DatasetSplits,
 ) -> None:
+    """
+    Log split size and positive-class distribution.
+    """
     split_data = {
         "train": (
             splits.X_train,
@@ -1153,7 +1164,7 @@ def log_fitted_pipeline_summary(
     """
     Verify train/validation preprocessing compatibility.
 
-    The test partition is deliberately not transformed here.
+    Test data is deliberately not transformed here.
     """
     fitted_preprocessor = model_pipeline.named_steps["preprocessor"]
 
@@ -1170,8 +1181,8 @@ def log_fitted_pipeline_summary(
 
     if transformed_train.shape[1] != transformed_validation.shape[1]:
         raise RuntimeError(
-            "Preprocessing produced inconsistent feature counts "
-            "between training and validation"
+            "Preprocessing produced inconsistent "
+            "feature counts between training and validation"
         )
 
     feature_names = fitted_preprocessor.named_steps[
@@ -1197,6 +1208,9 @@ def log_fitted_pipeline_summary(
 def log_comparison_table(
     evaluations: list[CandidateEvaluation],
 ) -> None:
+    """
+    Log side-by-side validation results.
+    """
     comparison = pd.DataFrame(
         [
             {
@@ -1231,6 +1245,10 @@ def log_comparison_table(
 
 
 def main() -> None:
+    # ------------------------------------------------------------------
+    # Load and split
+    # ------------------------------------------------------------------
+
     X, y = load_dataset()
 
     splits = create_stratified_splits(
@@ -1239,6 +1257,10 @@ def main() -> None:
     )
 
     log_split_summary(splits)
+
+    # ------------------------------------------------------------------
+    # Controlled candidate evaluation
+    # ------------------------------------------------------------------
 
     evaluations: list[CandidateEvaluation] = []
 
@@ -1251,6 +1273,10 @@ def main() -> None:
         evaluations.append(evaluation)
 
     log_comparison_table(evaluations)
+
+    # ------------------------------------------------------------------
+    # Validation-based selection
+    # ------------------------------------------------------------------
 
     selected = select_best_candidate(evaluations)
 
@@ -1289,6 +1315,10 @@ def main() -> None:
         selected.metrics.f1,
     )
 
+    # ------------------------------------------------------------------
+    # MLflow registration
+    # ------------------------------------------------------------------
+
     _, registered_model_name = configure_mlflow()
 
     registration = register_selected_model(
@@ -1297,11 +1327,19 @@ def main() -> None:
         registered_model_name=(registered_model_name),
     )
 
+    # ------------------------------------------------------------------
+    # Registered-artifact verification
+    # ------------------------------------------------------------------
+
     verify_registered_model(
         registration=registration,
         selected=selected,
         splits=splits,
     )
+
+    # ------------------------------------------------------------------
+    # Explicit sealed-test guardrail
+    # ------------------------------------------------------------------
 
     logger.info("Training lifecycle completed using training and validation data only.")
 
