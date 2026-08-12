@@ -12,7 +12,7 @@ from typing import Any, Final
 
 import httpx
 import mlflow.sklearn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sklearn.pipeline import Pipeline
@@ -353,12 +353,32 @@ class ErrorResponse(BaseModel):
     details: str | None = None
 
 
-def build_drift_payload() -> dict[str, Any]:
+def get_deployed_model(request: Request) -> LoadedRegisteredModel:
+    """
+    Return the model loaded during application lifespan startup.
+
+    Reaching this failure would indicate an application lifecycle invariant
+    has been broken, because successful startup always installs this state.
+    """
+    deployed_model = getattr(request.app.state, "deployed_model", None)
+
+    if not isinstance(deployed_model, LoadedRegisteredModel):
+        raise RuntimeError("Model Service deployment state is unavailable")
+
+    return deployed_model
+
+
+def build_drift_payload(
+    *,
+    model_name: str,
+    model_version: str,
+) -> dict[str, Any]:
     """
     Build the deterministic drift webhook documented in DECISIONS.md.
 
     The fixed report_id allows repeated requests to test webhook
-    deduplication in the Agent.
+    deduplication in the Agent. Model identity is supplied by the registered
+    artifact loaded during application startup rather than being hardcoded.
     """
     return {
         "schema_version": "1.0",
@@ -366,8 +386,8 @@ def build_drift_payload() -> dict[str, Any]:
         "report_id": ("drift-report-customer-churn-model-v12-2026-07-22T12:00:00Z"),
         "timestamp": "2026-07-22T12:00:00Z",
         "model": {
-            "name": "customer-churn-model",
-            "version": "12",
+            "name": model_name,
+            "version": model_version,
         },
         "overall_severity": {
             "previous": "low",
@@ -471,8 +491,15 @@ async def health() -> dict[str, str]:
         },
     },
 )
-async def trigger_debug_drift() -> DriftDispatchResponse | JSONResponse:
-    payload = build_drift_payload()
+async def trigger_debug_drift(
+    request: Request,
+) -> DriftDispatchResponse | JSONResponse:
+    deployed_model = get_deployed_model(request)
+
+    payload = build_drift_payload(
+        model_name=deployed_model.name,
+        model_version=deployed_model.version,
+    )
     report_id = payload["report_id"]
 
     if not DRIFT_WEBHOOK_SECRET:
