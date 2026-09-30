@@ -7,6 +7,7 @@ annotated-types==0.8.0
 anyio==4.14.2
     # via
     #   httpx
+    #   mlflow-skinny
     #   starlette
     #   watchfiles
 cachetools==7.1.7
@@ -32,7 +33,7 @@ databricks-sdk==0.127.0
     # via mlflow-skinny
 fastapi==0.141.1
     # via
-    #   -r model_service/requirements.in
+    #   -r requirements.in
     #   mlflow-skinny
 gitdb==4.0.12
     # via gitpython
@@ -49,7 +50,7 @@ httpcore==1.0.9
 httptools==0.8.0
     # via uvicorn
 httpx==0.28.1
-    # via -r model_service/requirements.in
+    # via -r requirements.in
 idna==3.18
     # via
     #   anyio
@@ -59,13 +60,13 @@ importlib-metadata==9.0.0
     # via mlflow-skinny
 joblib==1.5.3
     # via scikit-learn
-mlflow-skinny==3.15.1
-    # via -r model_service/requirements.in
+mlflow-skinny==3.16.1
+    # via -r requirements.in
 narwhals==2.24.0
     # via scikit-learn
-numpy==2.4.6
+numpy==2.5.3
     # via
-    #   -r model_service/requirements.in
+    #   -r requirements.in
     #   pandas
     #   scikit-learn
     #   scipy
@@ -85,8 +86,8 @@ packaging==26.3
     # via
     #   mlflow-skinny
     #   skops
-pandas==3.0.5
-    # via -r model_service/requirements.in
+pandas==3.0.6
+    # via -r requirements.in
 prettytable==3.18.0
     # via skops
 protobuf==6.33.6
@@ -120,9 +121,9 @@ requests==2.34.2
     # via
     #   databricks-sdk
     #   mlflow-skinny
-scikit-learn==1.9.0
+scikit-learn==1.9.1
     # via
-    #   -r model_service/requirements.in
+    #   -r requirements.in
     #   skops
 scipy==1.17.1
     # via
@@ -130,8 +131,8 @@ scipy==1.17.1
     #   skops
 six==1.17.0
     # via python-dateutil
-skops==0.14.0
-    # via -r model_service/requirements.in
+skops==0.16.0
+    # via -r requirements.in
 smmap==5.0.3
     # via gitdb
 sqlparse==0.5.5
@@ -144,7 +145,6 @@ threadpoolctl==3.6.0
     # via scikit-learn
 typing-extensions==4.16.0
     # via
-    #   anyio
     #   fastapi
     #   mlflow-skinny
     #   opentelemetry-api
@@ -152,7 +152,6 @@ typing-extensions==4.16.0
     #   opentelemetry-semantic-conventions
     #   pydantic
     #   pydantic-core
-    #   starlette
     #   typing-inspection
 typing-inspection==0.4.2
     # via
@@ -162,9 +161,9 @@ urllib3==2.7.0
     # via
     #   databricks-sdk
     #   requests
-uvicorn==0.52.1
+uvicorn[standard]==0.54.0
     # via
-    #   -r model_service/requirements.in
+    #   -r requirements.in
     #   mlflow-skinny
 uvloop==0.22.1
     # via uvicorn
