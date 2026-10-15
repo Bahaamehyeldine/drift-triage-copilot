@@ -38,7 +38,7 @@ jobs:
             migrations/requirements.txt
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@v7
 
       - name: Install test and service dependencies
         run: |
